@@ -106,6 +106,17 @@ def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50):
     expose_namespaces(net)
 
     # ---------------------------------------------------------------
+    # Fix interface IPs — Mininet 2.2.x ignores params1/params2 IP
+    # overrides in addLink, so set them explicitly after start.
+    # ---------------------------------------------------------------
+    h1.cmd("ip addr flush dev h1-eth0")
+    h1.cmd("ip addr add 10.0.1.2/24 dev h1-eth0")
+    r1.cmd("ip addr flush dev r1-eth0")
+    r1.cmd("ip addr add 10.0.1.1/24 dev r1-eth0")
+    r1.cmd("ip addr flush dev r1-eth1")
+    r1.cmd("ip addr add 10.0.0.254/24 dev r1-eth1")
+
+    # ---------------------------------------------------------------
     # Routing: clients reach h1 via r1
     # ---------------------------------------------------------------
     h1.cmd("ip route add 10.0.0.0/24 via 10.0.1.1")
