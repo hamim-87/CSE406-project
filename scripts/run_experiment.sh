@@ -147,7 +147,7 @@ time.sleep(2)
 subprocess.Popen([
     'ip', 'netns', 'exec', 'h3',
     'python3', '${SRC_DIR}/honest_client.py',
-    '--url', 'http://10.0.0.1/video.mp4',
+    '--url', 'http://10.0.1.2/video.mp4',
     '--output', '${RESULTS_DIR}/${tag}/honest_throughput.csv',
     '--duration', '${DURATION}',
 ])
@@ -197,7 +197,7 @@ time.sleep(2)
 honest = subprocess.Popen([
     'ip', 'netns', 'exec', 'h3',
     'python3', '${SRC_DIR}/honest_client.py',
-    '--url', 'http://10.0.0.1/video.mp4',
+    '--url', 'http://10.0.1.2/video.mp4',
     '--output', '${RESULTS_DIR}/${tag}/honest_throughput.csv',
     '--duration', '${DURATION}',
 ])
@@ -208,7 +208,7 @@ time.sleep(5)  # let honest flow stabilize
 attacker = subprocess.Popen([
     'ip', 'netns', 'exec', 'h2',
     'python3', '${SRC_DIR}/optimistic_client.py',
-    '--server', '10.0.0.1',
+    '--server', '10.0.1.2',
     '--port', '80',
     '--delta', '${OPT_DELTA}',
     '--rate', '${OPT_RATE}',
@@ -287,7 +287,7 @@ time.sleep(2)
 honest = subprocess.Popen([
     'ip', 'netns', 'exec', 'h3',
     'python3', '${SRC_DIR}/honest_client.py',
-    '--url', 'http://10.0.0.1/video.mp4',
+    '--url', 'http://10.0.1.2/video.mp4',
     '--output', '${RESULTS_DIR}/${tag}/honest_throughput.csv',
     '--duration', '${DURATION}',
 ])
@@ -298,7 +298,7 @@ time.sleep(5)
 attacker = subprocess.Popen([
     'ip', 'netns', 'exec', 'h2',
     'python3', '${SRC_DIR}/optimistic_client.py',
-    '--server', '10.0.0.1',
+    '--server', '10.0.1.2',
     '--port', '80',
     '--delta', '${OPT_DELTA}',
     '--rate', '${OPT_RATE}',

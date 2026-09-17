@@ -47,7 +47,7 @@ def expose_namespaces(net):
     for host in net.hosts:
         src = f"/proc/{host.pid}/ns/net"
         dst = f"{ns_dir}/{host.name}"
-        if os.path.exists(dst):
+        if os.path.islink(dst) or os.path.exists(dst):
             os.remove(dst)
         os.symlink(src, dst)
     info("*** Network namespaces exposed for ip netns exec\n")
