@@ -26,9 +26,13 @@ DELAY_MS=50          # one-way bottleneck delay
 BW_MBPS=10           # bottleneck bandwidth
 QUEUE_PKTS=50        # bottleneck queue depth
 
-# Optimistic ACK parameters (adaptive attacker)
-OPT_TARGET_BW=10     # target bandwidth to steal (Mbps)
-OPT_MULTIPLIER=5.0   # target cwnd as multiple of BDP
+# Optimistic ACK parameters (paced attacker)
+OPT_TARGET_BW=20     # bandwidth to steal via optimistic ACKing (Mbps, ~2x path)
+OPT_MULTIPLIER=2.0   # max optimistic lead as a multiple of BDP
+
+# Client peer IPs (as the server sees them) — used to tag telemetry flows
+ATTACKER_IP=10.0.0.3
+HONEST_IP=10.0.0.2
 
 # Colors for output
 RED='\033[0;31m'
@@ -140,6 +144,8 @@ subprocess.Popen([
     '--queue-csv', '${RESULTS_DIR}/${tag}/queue_metrics.csv',
     '--router-iface', 'r1-eth1',
     '--ns-cmd', 'ip netns exec r1',
+    '--attacker-ip', '${ATTACKER_IP}',
+    '--honest-ip', '${HONEST_IP}',
 ])
 
 # Run honest client on h3
@@ -189,6 +195,8 @@ telem = subprocess.Popen([
     '--queue-csv', '${RESULTS_DIR}/${tag}/queue_metrics.csv',
     '--router-iface', 'r1-eth1',
     '--ns-cmd', 'ip netns exec r1',
+    '--attacker-ip', '${ATTACKER_IP}',
+    '--honest-ip', '${HONEST_IP}',
 ])
 
 time.sleep(2)
@@ -263,8 +271,8 @@ defense = subprocess.Popen([
     'python3', '${DEFENSE_DIR}/defense_loader.py',
     '--iface', 'h1-eth0',
     '--obj', '${DEFENSE_DIR}/defense_inspector.o',
-    '--mode', 'skb',
-    '--interval', '0.5',
+    '--mode', 'generic',
+    '--interval', '1.0',
 ])
 
 time.sleep(2)
@@ -279,6 +287,8 @@ telem = subprocess.Popen([
     '--queue-csv', '${RESULTS_DIR}/${tag}/queue_metrics.csv',
     '--router-iface', 'r1-eth1',
     '--ns-cmd', 'ip netns exec r1',
+    '--attacker-ip', '${ATTACKER_IP}',
+    '--honest-ip', '${HONEST_IP}',
 ])
 
 time.sleep(2)
@@ -360,22 +370,24 @@ else:
         if [[ -f "${scenario_dir}/tcp_metrics.csv" ]]; then
             cwnd_info=$(python3 -c "
 import csv
-vals = []
+from collections import defaultdict
+byrole = defaultdict(list)
 with open('${scenario_dir}/tcp_metrics.csv') as f:
-    reader = csv.DictReader(f)
-    for row in reader:
+    for row in csv.DictReader(f):
         try:
-            v = int(row['cwnd'])
-            vals.append(v)
+            byrole[row.get('role', 'other')].append(int(row['cwnd']))
         except (KeyError, ValueError):
             pass
-if vals:
-    print(f'cwnd — Avg: {sum(vals)/len(vals):.0f}  '
-          f'Max: {max(vals)}  Samples: {len(vals)}')
+if byrole:
+    for role in ('honest', 'attacker', 'other'):
+        vals = byrole.get(role)
+        if vals:
+            print(f'cwnd[{role}] — Avg: {sum(vals)/len(vals):.0f}  '
+                  f'Max: {max(vals)}  Samples: {len(vals)}')
 else:
     print('No cwnd data')
 " 2>/dev/null || echo "  (analysis failed)")
-            echo "  $cwnd_info"
+            echo "$cwnd_info" | sed 's/^/  /'
         fi
         echo ""
     done

@@ -70,27 +70,61 @@ def plot_throughput(results_dir, output_dir):
     print(f"  → {output_dir}/throughput_comparison.png")
 
 
+def load_flow_cwnd(path, role):
+    """Load (elapsed_s, cwnd) for one flow role from a per-flow tcp CSV."""
+    xs, ys = [], []
+    if not os.path.exists(path):
+        return xs, ys
+    with open(path) as f:
+        for row in csv.DictReader(f):
+            if row.get("role") != role:
+                continue
+            try:
+                xs.append(float(row.get("elapsed_s", 0) or 0))
+                ys.append(float(row.get("cwnd", 0) or 0))
+            except (ValueError, TypeError):
+                pass
+    return xs, ys
+
+
 def plot_cwnd(results_dir, output_dir):
-    """Plot server cwnd across scenarios."""
+    """
+    Plot the server's per-flow cwnd across scenarios.
+
+    Each flow is drawn separately (honest = solid, attacker = dashed), keyed
+    off the telemetry ``role`` column. This is what makes the attacker's
+    window inflation distinguishable from the honest client's — the old
+    single-line plot mixed both flows into one uninterpretable trace.
+    """
     fig, ax = plt.subplots(figsize=(10, 5))
 
     scenarios = {
-        "baseline_cubic": ("Baseline", "#2196F3", "-"),
-        "attack_cubic":   ("Under Attack", "#F44336", "--"),
-        "defense_cubic":  ("With Defense", "#4CAF50", "-."),
+        "baseline_cubic": ("Baseline", "#2196F3"),
+        "attack_cubic":   ("Attack", "#F44336"),
+        "defense_cubic":  ("Defense", "#4CAF50"),
     }
+    # role -> (linestyle, legend suffix)
+    roles = {"honest": ("-", "honest"), "attacker": ("--", "attacker")}
 
-    for folder, (label, color, ls) in scenarios.items():
+    plotted = False
+    for folder, (label, color) in scenarios.items():
         path = os.path.join(results_dir, folder, "tcp_metrics.csv")
-        data = load_csv(path, ["elapsed_s", "cwnd"])
-        if data["elapsed_s"]:
-            ax.plot(data["elapsed_s"], data["cwnd"],
-                    label=label, color=color, linestyle=ls, linewidth=1.5)
+        for role, (ls, suffix) in roles.items():
+            xs, ys = load_flow_cwnd(path, role)
+            if xs:
+                ax.plot(xs, ys, label=f"{label} — {suffix}",
+                        color=color, linestyle=ls, linewidth=1.5)
+                plotted = True
 
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("cwnd (segments)")
-    ax.set_title("Server Congestion Window — Baseline vs Attack vs Defense")
-    ax.legend()
+    ax.set_title("Server Congestion Window per Flow — Baseline vs Attack vs Defense")
+    if plotted:
+        ax.legend(fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "No per-flow cwnd data\n(re-run experiments to "
+                "regenerate tcp_metrics.csv with the 'role' column)",
+                ha="center", va="center", transform=ax.transAxes, fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.set_ylim(bottom=0)
     fig.tight_layout()

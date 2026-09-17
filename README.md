@@ -27,22 +27,29 @@ h2    h3
 - **h1** serves a 200 MB `video.mp4` over NGINX.
 - **h3** is an honest client doing a normal HTTP download.
 - **h2** performs the optimistic-ACK attack: it completes a real TCP
-  handshake and HTTP GET via raw sockets (Scapy), then injects forged ACK
-  segments that advance `ack_seq` by a fixed Δ every `1/rate` seconds —
-  without ever receiving the corresponding data.
+  handshake and HTTP GET via raw sockets (Scapy), then paces forged ACKs at a
+  target steal-rate that acknowledge data the server has sent but that h2 has
+  **not** received yet. This hides bottleneck loss from the server (so it
+  never backs off) while a safety clamp keeps the ACK number at/below the
+  server's real `snd_max`, so the connection is never reset by the kernel's
+  ACK-validation rules.
 - **r1** shapes the link to a fixed bandwidth/delay/queue depth to make the
   attack's effect on the bottleneck observable.
 - Telemetry samples the server's TCP socket state (`ss -ti`) and the
   bottleneck queue (`tc -s qdisc`) throughout each run.
-- The **defense** (`defense/defense_inspector.c`) is an XDP program attached
-  to the server's ingress interface. It drops ACKs that either:
-  1. Acknowledge data beyond `snd_max` (sent-bound check), or
-  2. Advance the ACK number faster than the path's bandwidth + margin
-     allows (rate-bound check).
+- The **defense** (`defense/defense_inspector.c`) is a pair of eBPF programs
+  sharing one flow table:
+  1. An **XDP ingress** filter on the server drops client ACKs that either
+     acknowledge data beyond `snd_max` (sent-bound check) or advance the ACK
+     number faster than the path bandwidth + margin allows (rate-bound check,
+     a per-flow token bucket).
+  2. A **TC egress** program on the same interface watches the server's
+     outgoing data and records each flow's true `snd_max` directly in the
+     datapath — so the sent-bound check has an accurate, absolute sequence
+     bound with no fragile userspace bookkeeping.
 
-  `defense/defense_loader.py` loads the XDP program and periodically
-  refreshes each flow's `snd_max` in the BPF map by reading `ss` output on
-  the server.
+  `defense/defense_loader.py` loads both programs with shared (pinned) maps,
+  attaches them, and reports live drop counters.
 
 ## Repository layout
 
@@ -96,11 +103,14 @@ Each scenario:
 
 Tunable parameters live at the top of `run_experiment.sh`: `DURATION`,
 `CC_ALGO` (`cubic`/`reno`), `DELAY_MS`, `BW_MBPS`, `QUEUE_PKTS`,
-`OPT_DELTA` (bytes advanced per forged ACK), `OPT_RATE` (forged ACKs/sec).
+`OPT_TARGET_BW` (Mbps the attacker tries to steal via optimistic ACKing) and
+`OPT_MULTIPLIER` (max optimistic lead as a multiple of the BDP).
 
 Results are written to `/tmp/cse406/results/<scenario>_<cc>/`:
 - `honest_throughput.csv` — timestamp, elapsed time, goodput (Mbps)
-- `tcp_metrics.csv` — cwnd, ssthresh, RTT, retransmits, etc.
+- `tcp_metrics.csv` — cwnd, ssthresh, RTT, retransmits, etc. **One row per
+  flow per sample**, tagged with `peer_ip`/`peer_port`/`role` (`honest` vs
+  `attacker`) so the two connections are never conflated.
 - `queue_metrics.csv` — bottleneck queue backlog and drops
 
 Logs are written to `/tmp/cse406/logs/`.

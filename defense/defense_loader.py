@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 """
-defense_loader.py — eBPF/XDP Program Loader & snd_max Updater
+defense_loader.py — eBPF Program Loader (XDP ingress + TC egress)
 CSE 406: Computer Security Lab Project
 
-Loads the compiled XDP program (defense_inspector.o) onto the server's
-ingress interface and periodically updates per-flow snd_max values by
-reading the kernel's TCP socket state via `ss`.
+Loads defense_inspector.o and attaches both of its programs to the server's
+interface so they share one flow_table map:
 
-Also prints live statistics from the BPF counters map.
+  * xdp_ack_filter  → XDP on ingress  (filters incoming client ACKs)
+  * tc_snd_tracker  → TC clsact egress (learns snd_max from outgoing data)
+
+snd_max is now maintained entirely in the datapath by the egress program.
+The previous version tried to push snd_max in from userspace by parsing `ss`
+and writing a *partial* value with `bpftool map update` — the byte count
+never matched the 48-byte flow_state, so every update silently failed and the
+sent-bound check saw snd_max == 0 forever (the defense did nothing). That
+whole path is gone.
+
+Map sharing across the two hooks is achieved by loading the object once with
+`bpftool prog loadall ... pinmaps <dir>` (maps are declared LIBBPF_PIN_BY_NAME
+in the C), then attaching each pinned program. This is the piece that is
+easy to get wrong on a fresh VM, so it is done explicitly and checked.
 """
 
 import argparse
-import ctypes
+import json
 import logging
 import os
-import re
 import signal
-import socket
 import struct
 import subprocess
 import sys
@@ -29,170 +39,150 @@ logging.basicConfig(
 )
 log = logging.getLogger("defense_loader")
 
+BPFFS = "/sys/fs/bpf"
+PIN_DIR = "/sys/fs/bpf/cse406_defense"
+XDP_PROG = "xdp_ack_filter"      # must match SEC/func name in the .c (<=15 chars)
+TC_PROG = "tc_snd_tracker"       # must match SEC/func name in the .c (<=15 chars)
 
-# ──────────────────────────────────────────────────────────────────────
-# BPF map interaction via bpftool (simpler than ctypes for a lab)
-# ──────────────────────────────────────────────────────────────────────
-def load_xdp(iface, obj_path, mode="skb"):
-    """Attach the XDP program to the given interface."""
-    # Remove any existing XDP program
-    subprocess.run(["ip", "link", "set", "dev", iface, "xdp", "off"],
-                   capture_output=True)
+COUNTER_LABELS = [
+    "total_pkts", "tcp_acks", "drops_sent_bound",
+    "drops_rate_bound", "egress_pkts", "snd_max_updates",
+]
 
-    cmd = ["ip", "link", "set", "dev", iface, f"xdp{mode}", "obj",
-           obj_path, "sec", "xdp"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        log.error("Failed to load XDP program: %s", result.stderr)
+
+def run(cmd, check=True, quiet=False):
+    """Run a command, logging failures. Returns CompletedProcess."""
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0 and not quiet:
+        log.error("cmd failed (%d): %s", res.returncode, " ".join(cmd))
+        if res.stderr.strip():
+            log.error("  stderr: %s", res.stderr.strip())
+    if check and res.returncode != 0:
         sys.exit(1)
-    log.info("XDP program loaded on %s (mode=%s)", iface, mode)
+    return res
 
 
-def unload_xdp(iface):
-    """Detach any XDP program from the interface."""
+def ensure_bpffs():
+    """Make sure the BPF filesystem is mounted (needed for map pinning)."""
+    if not os.path.ismount(BPFFS):
+        os.makedirs(BPFFS, exist_ok=True)
+        run(["mount", "-t", "bpf", "none", BPFFS])
+        log.info("Mounted bpffs at %s", BPFFS)
+
+
+def load_and_attach(iface, obj_path, xdp_mode):
+    """Load both programs with shared maps and attach them to `iface`."""
+    if not os.path.exists(obj_path):
+        log.error("BPF object not found: %s (compile it first)", obj_path)
+        sys.exit(1)
+
+    ensure_bpffs()
+
+    # Clean any prior state so a re-run starts fresh.
+    detach(iface, quiet=True)
+
+    # Load the whole object once; pin every program and map under PIN_DIR.
+    # Sharing the pinned maps is what lets the egress tracker's snd_max reach
+    # the ingress filter.
+    run(["bpftool", "prog", "loadall", obj_path, PIN_DIR, "pinmaps", PIN_DIR])
+    log.info("Loaded %s (progs + maps pinned under %s)", obj_path, PIN_DIR)
+
+    xdp_pin = os.path.join(PIN_DIR, XDP_PROG)
+    tc_pin = os.path.join(PIN_DIR, TC_PROG)
+    for p in (xdp_pin, tc_pin):
+        if not os.path.exists(p):
+            log.error("Expected pinned program missing: %s", p)
+            log.error("  (check the SEC/function names in defense_inspector.c)")
+            detach(iface, quiet=True)
+            sys.exit(1)
+
+    # Attach XDP (ingress) from the pinned program.
+    run(["ip", "link", "set", "dev", iface, f"xdp{xdp_mode}",
+         "pinned", xdp_pin])
+    log.info("XDP filter attached on %s ingress (mode=%s)", iface, xdp_mode)
+
+    # Attach TC (egress) from the pinned program via a clsact qdisc.
+    run(["tc", "qdisc", "add", "dev", iface, "clsact"], check=False, quiet=True)
+    run(["tc", "filter", "add", "dev", iface, "egress",
+         "bpf", "da", "pinned", tc_pin])
+    log.info("TC snd_max tracker attached on %s egress", iface)
+
+
+def detach(iface, quiet=False):
+    """Remove both programs and all pinned state."""
+    subprocess.run(["ip", "link", "set", "dev", iface, "xdpgeneric", "off"],
+                   capture_output=True)
     subprocess.run(["ip", "link", "set", "dev", iface, "xdp", "off"],
                    capture_output=True)
-    log.info("XDP program unloaded from %s", iface)
+    # Deleting the clsact qdisc removes the egress filter with it.
+    subprocess.run(["tc", "qdisc", "del", "dev", iface, "clsact"],
+                   capture_output=True)
+    subprocess.run(["rm", "-rf", PIN_DIR], capture_output=True)
+    if not quiet:
+        log.info("Detached XDP/TC programs and removed pins from %s", iface)
 
 
 def read_counters():
-    """Read the global counters from the BPF array map."""
-    labels = ["total_pkts", "tcp_acks", "drops_sent_bound", "drops_rate_bound"]
+    """Read the global counters from the pinned BPF array map."""
     values = {}
+    pin = os.path.join(PIN_DIR, "counters")
     try:
         raw = subprocess.check_output(
-            ["bpftool", "map", "dump", "name", "counters", "-j"],
+            ["bpftool", "map", "dump", "pinned", pin, "-j"],
             text=True, timeout=2
         )
-        import json
-        entries = json.loads(raw)
-        for entry in entries:
+        for entry in json.loads(raw):
             key_bytes = entry.get("key", [])
             val_bytes = entry.get("value", [])
             if len(key_bytes) >= 4 and len(val_bytes) >= 8:
                 idx = struct.unpack_from("<I", bytes(key_bytes))[0]
                 val = struct.unpack_from("<Q", bytes(val_bytes))[0]
-                if idx < len(labels):
-                    values[labels[idx]] = val
+                if idx < len(COUNTER_LABELS):
+                    values[COUNTER_LABELS[idx]] = val
     except Exception:
         pass
     return values
 
 
-def get_tcp_snd_max():
-    """
-    Parse `ss -ti` to extract per-flow (src:port → dst:port) snd_max.
-    snd_max ≈ bytes_sent value from ss, converted to absolute seq.
-    For simplicity, we use bytes_sent + ISN as an approximation.
-
-    Returns dict: {(src_ip, src_port, dst_ip, dst_port): snd_max_estimate}
-    """
-    flows = {}
+def count_flows():
+    """Return the number of entries currently in the flow_table map."""
+    pin = os.path.join(PIN_DIR, "flow_table")
     try:
         raw = subprocess.check_output(
-            ["ss", "-ti", "state", "established", "sport", "=", ":80"],
+            ["bpftool", "map", "dump", "pinned", pin, "-j"],
             text=True, timeout=2
         )
-        # Parse connection lines and their info blocks
-        lines = raw.strip().split("\n")
-        current_flow = None
-        for line in lines:
-            # Connection line: "ESTAB 0 12345 10.0.0.1:80 10.0.0.3:44444"
-            conn_match = re.match(
-                r"\s*ESTAB\s+\d+\s+(\d+)\s+"
-                r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+"
-                r"(\d+\.\d+\.\d+\.\d+):(\d+)",
-                line
-            )
-            if conn_match:
-                send_q = int(conn_match.group(1))
-                src_ip = conn_match.group(2)
-                src_port = int(conn_match.group(3))
-                dst_ip = conn_match.group(4)
-                dst_port = int(conn_match.group(5))
-                current_flow = (dst_ip, dst_port, src_ip, src_port)
-                continue
-
-            # Info line with bytes_sent
-            if current_flow:
-                bs_match = re.search(r"bytes_sent:(\d+)", line)
-                ba_match = re.search(r"bytes_acked:(\d+)", line)
-                if bs_match:
-                    bytes_sent = int(bs_match.group(1))
-                    flows[current_flow] = bytes_sent
-                current_flow = None
-
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-        pass
-
-    return flows
+        return len(json.loads(raw))
+    except Exception:
+        return 0
 
 
-def update_flow_snd_max(flows_data):
-    """
-    Update the snd_max field in the BPF flow_table map for each active flow.
-    Uses bpftool to write into the map.
-    """
-    for (src_ip, src_port, dst_ip, dst_port), snd_max in flows_data.items():
-        try:
-            # Pack the flow key: src_ip(4) dst_ip(4) src_port(2) dst_port(2)
-            src_bytes = socket.inet_aton(src_ip)
-            dst_bytes = socket.inet_aton(dst_ip)
-            key_hex = " ".join(f"0x{b:02x}" for b in (
-                src_bytes + dst_bytes +
-                struct.pack("!HH", src_port, dst_port)
-            ))
-
-            # Read current state
-            result = subprocess.run(
-                ["bpftool", "map", "lookup", "name", "flow_table",
-                 "key", "hex"] + key_hex.split(),
-                capture_output=True, text=True, timeout=2
-            )
-            if result.returncode != 0:
-                continue
-
-            # Update snd_max (first 4 bytes of flow_state value)
-            snd_max_bytes = struct.pack("<I", snd_max & 0xFFFFFFFF)
-            snd_max_hex = " ".join(f"0x{b:02x}" for b in snd_max_bytes)
-
-            # We need to read-modify-write; for lab purposes, we update
-            # just the snd_max field using bpftool
-            subprocess.run(
-                ["bpftool", "map", "update", "name", "flow_table",
-                 "key", "hex"] + key_hex.split() +
-                ["value", "hex"] + snd_max_hex.split(),
-                capture_output=True, timeout=2
-            )
-        except Exception as e:
-            log.debug("Error updating flow %s:%d → %s:%d: %s",
-                      src_ip, src_port, dst_ip, dst_port, e)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Main loop
-# ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Load XDP ACK filter and maintain per-flow snd_max"
+        description="Load XDP+TC optimistic-ACK filter and report stats"
     )
     parser.add_argument("--iface", default="h1-eth0",
-                        help="Interface to attach XDP program (default: h1-eth0)")
+                        help="Interface to attach programs to (default: h1-eth0)")
     parser.add_argument("--obj", default="/opt/cse406/defense/defense_inspector.o",
                         help="Path to compiled BPF object file")
-    parser.add_argument("--mode", default="skb", choices=["skb", "drv", "hw"],
-                        help="XDP attach mode (default: skb for veth)")
-    parser.add_argument("--interval", type=float, default=0.5,
-                        help="snd_max update interval in seconds (default: 0.5)")
+    parser.add_argument("--mode", default="generic",
+                        choices=["generic", "skb", "drv", "hw"],
+                        help="XDP attach mode (default: generic, for veth)")
+    parser.add_argument("--interval", type=float, default=1.0,
+                        help="Stats print interval in seconds (default: 1.0)")
     parser.add_argument("--unload", action="store_true",
-                        help="Unload XDP program and exit")
+                        help="Detach programs and exit")
     args = parser.parse_args()
 
+    # `ip link set ... xdpgeneric` is the veth-friendly generic mode; accept
+    # the old "skb" spelling as an alias for it.
+    xdp_mode = "generic" if args.mode in ("generic", "skb") else args.mode
+
     if args.unload:
-        unload_xdp(args.iface)
+        detach(args.iface)
         return
 
-    load_xdp(args.iface, args.obj, args.mode)
+    load_and_attach(args.iface, args.obj, xdp_mode)
 
     running = True
     def stop_handler(sig, frame):
@@ -201,32 +191,24 @@ def main():
     signal.signal(signal.SIGINT, stop_handler)
     signal.signal(signal.SIGTERM, stop_handler)
 
-    log.info("Entering snd_max update loop (every %.1fs)", args.interval)
-    update_count = 0
-
+    log.info("Entering stats loop (every %.1fs). Ctrl-C to stop.", args.interval)
+    tick = 0
     try:
         while running:
-            # Update snd_max for all active flows
-            flows = get_tcp_snd_max()
-            if flows:
-                update_flow_snd_max(flows)
-            update_count += 1
-
-            # Print stats every 10 iterations
-            if update_count % 10 == 0:
+            tick += 1
+            if tick % max(1, int(round(1.0 / args.interval))) == 0 or args.interval >= 1:
                 stats = read_counters()
-                log.info("Stats: pkts=%s acks=%s drop_sent=%s drop_rate=%s "
-                         "| active_flows=%d",
-                         stats.get("total_pkts", "?"),
+                log.info("acks=%s | dropped sent-bound=%s rate-bound=%s | "
+                         "egress=%s snd_max_upd=%s | flows=%d",
                          stats.get("tcp_acks", "?"),
                          stats.get("drops_sent_bound", "?"),
                          stats.get("drops_rate_bound", "?"),
-                         len(flows))
-
+                         stats.get("egress_pkts", "?"),
+                         stats.get("snd_max_updates", "?"),
+                         count_flows())
             time.sleep(args.interval)
-
     finally:
-        unload_xdp(args.iface)
+        detach(args.iface)
         log.info("Defense module stopped cleanly")
 
 
