@@ -26,9 +26,9 @@ DELAY_MS=50          # one-way bottleneck delay
 BW_MBPS=10           # bottleneck bandwidth
 QUEUE_PKTS=50        # bottleneck queue depth
 
-# Optimistic ACK parameters
-OPT_DELTA=14600      # bytes per ACK (10 × MSS)
-OPT_RATE=200         # ACKs/second
+# Optimistic ACK parameters (adaptive attacker)
+OPT_TARGET_BW=10     # target bandwidth to steal (Mbps)
+OPT_MULTIPLIER=5.0   # target cwnd as multiple of BDP
 
 # Colors for output
 RED='\033[0;31m'
@@ -204,14 +204,14 @@ honest = subprocess.Popen([
 
 time.sleep(5)  # let honest flow stabilize
 
-# Optimistic ACK attacker on h2
+# Optimistic ACK attacker on h2 (adaptive)
 attacker = subprocess.Popen([
     'ip', 'netns', 'exec', 'h2',
     'python3', '${SRC_DIR}/optimistic_client.py',
     '--server', '10.0.1.2',
     '--port', '80',
-    '--delta', '${OPT_DELTA}',
-    '--rate', '${OPT_RATE}',
+    '--target-bw', '${OPT_TARGET_BW}',
+    '--multiplier', '${OPT_MULTIPLIER}',
     '--duration', str(${DURATION} - 10),
 ])
 
@@ -294,14 +294,14 @@ honest = subprocess.Popen([
 
 time.sleep(5)
 
-# Optimistic ACK attacker on h2
+# Optimistic ACK attacker on h2 (adaptive)
 attacker = subprocess.Popen([
     'ip', 'netns', 'exec', 'h2',
     'python3', '${SRC_DIR}/optimistic_client.py',
     '--server', '10.0.1.2',
     '--port', '80',
-    '--delta', '${OPT_DELTA}',
-    '--rate', '${OPT_RATE}',
+    '--target-bw', '${OPT_TARGET_BW}',
+    '--multiplier', '${OPT_MULTIPLIER}',
     '--duration', str(${DURATION} - 10),
 ])
 
