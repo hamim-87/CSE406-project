@@ -139,6 +139,7 @@ subprocess.Popen([
     '--tcp-csv', '${RESULTS_DIR}/${tag}/tcp_metrics.csv',
     '--queue-csv', '${RESULTS_DIR}/${tag}/queue_metrics.csv',
     '--router-iface', 'r1-eth1',
+    '--ns-cmd', 'ip netns exec r1',
 ])
 
 # Run honest client on h3
@@ -187,6 +188,7 @@ telem = subprocess.Popen([
     '--tcp-csv', '${RESULTS_DIR}/${tag}/tcp_metrics.csv',
     '--queue-csv', '${RESULTS_DIR}/${tag}/queue_metrics.csv',
     '--router-iface', 'r1-eth1',
+    '--ns-cmd', 'ip netns exec r1',
 ])
 
 time.sleep(2)
@@ -276,6 +278,7 @@ telem = subprocess.Popen([
     '--tcp-csv', '${RESULTS_DIR}/${tag}/tcp_metrics.csv',
     '--queue-csv', '${RESULTS_DIR}/${tag}/queue_metrics.csv',
     '--router-iface', 'r1-eth1',
+    '--ns-cmd', 'ip netns exec r1',
 ])
 
 time.sleep(2)
