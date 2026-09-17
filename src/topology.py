@@ -21,7 +21,7 @@ import sys
 import time
 
 from mininet.net import Mininet
-from mininet.node import Node, OVSSwitch, Controller
+from mininet.node import Node, OVSBridge
 from mininet.link import TCLink
 from mininet.log import setLogLevel, info
 from mininet.cli import CLI
@@ -39,6 +39,28 @@ class LinuxRouter(Node):
         super().terminate()
 
 
+def expose_namespaces(net):
+    """Symlink each host's netns into /var/run/netns/ so that
+    'ip netns exec <name>' works from outside Mininet."""
+    ns_dir = "/var/run/netns"
+    os.makedirs(ns_dir, exist_ok=True)
+    for host in net.hosts:
+        src = f"/proc/{host.pid}/ns/net"
+        dst = f"{ns_dir}/{host.name}"
+        if os.path.exists(dst):
+            os.remove(dst)
+        os.symlink(src, dst)
+    info("*** Network namespaces exposed for ip netns exec\n")
+
+
+def cleanup_namespaces(net):
+    """Remove the symlinks created by expose_namespaces."""
+    for host in net.hosts:
+        dst = f"/var/run/netns/{host.name}"
+        if os.path.islink(dst):
+            os.remove(dst)
+
+
 def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50):
     """
     Build and return the Mininet network with the dumbbell topology.
@@ -50,8 +72,7 @@ def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50):
     bw_mbps    : int   — Bottleneck bandwidth in Mbps
     queue_pkts : int   — Bottleneck queue depth in packets
     """
-    net = Mininet(switch=OVSSwitch, link=TCLink, controller=Controller)
-    net.addController("c0")
+    net = Mininet(switch=OVSBridge, link=TCLink)
 
     # --- Hosts ---
     h1 = net.addHost("h1", ip="10.0.0.1/24")       # NGINX media server
@@ -82,6 +103,7 @@ def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50):
     net.addLink(s1, h3, intfName2="h3-eth0", bw=100)
 
     net.start()
+    expose_namespaces(net)
 
     # ---------------------------------------------------------------
     # Routing: clients reach h1 via r1
@@ -186,6 +208,7 @@ def main():
 
     info("*** Stopping network\n")
     h1.cmd("nginx -s stop 2>/dev/null; true")
+    cleanup_namespaces(net)
     net.stop()
 
 

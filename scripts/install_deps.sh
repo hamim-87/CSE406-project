@@ -12,8 +12,7 @@ apt-get update
 apt-get install -y mininet openvswitch-switch
 
 # Python packages
-apt-get install -y python3 python3-pip python3-scapy
-pip3 install matplotlib
+apt-get install -y python3 python3-pip python3-scapy python3-matplotlib
 
 # NGINX
 apt-get install -y nginx
@@ -22,9 +21,14 @@ apt-get install -y nginx
 apt-get install -y iproute2
 
 # eBPF toolchain
+# Note: "bpftool" is a virtual package on newer Ubuntu (provided by both
+# linux-tools-common and linux-lowlatency-tools-common) — apt refuses to
+# resolve it directly, so we install the kernel-specific tools package
+# that actually provides the bpftool binary.
 apt-get install -y clang llvm libelf-dev \
     linux-headers-$(uname -r) \
-    libbpf-dev bpftool
+    libbpf-dev \
+    linux-tools-common linux-tools-generic "linux-tools-$(uname -r)"
 
 # Useful utilities
 apt-get install -y tcpdump iperf3 net-tools curl

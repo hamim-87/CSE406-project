@@ -120,9 +120,8 @@ run_baseline() {
 
     # Start telemetry on h1
     log_step "Starting telemetry sampler..."
-    mn -c 2>/dev/null || true  # Mininet is already running from topology.py
 
-    # Use Mininet's Python API to run commands on hosts
+    # Use ip netns exec to run commands on Mininet hosts
     python3 -c "
 import time, subprocess, os, sys
 sys.path.insert(0, '${SRC_DIR}')
