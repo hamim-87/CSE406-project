@@ -55,14 +55,13 @@ SS_FIELDS = {
     "snd_wnd":    re.compile(r"snd_wnd:(\d+)"),
 }
 
-# A connection header line from `ss -tin`, e.g.
-#   ESTAB 0 0 10.0.1.2:80 10.0.0.3:44444
-# Local (group 1/2) is the server (sport :80); Peer (group 3/4) is the client.
-CONN_RE = re.compile(
-    r"^ESTAB\s+\d+\s+\d+\s+"
-    r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+"
-    r"(\d+\.\d+\.\d+\.\d+):(\d+)"
-)
+# An IPv4 address:port token as `ss` prints it, tolerating the forms that
+# actually occur on a dual-stack server. NGINX `listen 80` binds v6 too, so a
+# v4 client can appear IPv6-mapped and/or bracketed:
+#   10.0.1.2:80        [::ffff:10.0.1.2]:80        ::ffff:10.0.1.2:80
+# The optional leading '[', '::ffff:' and trailing ']' are stripped by the
+# regex so only the dotted-quad IPv4 and the port are captured.
+ADDR_RE = re.compile(r"\[?(?:::ffff:)?(\d+\.\d+\.\d+\.\d+)\]?:(\d+)")
 
 
 def parse_ss_output(raw):
@@ -80,9 +79,13 @@ def parse_ss_flows(raw):
 
     Returns a list of dicts, each with the parsed SS_FIELDS plus
     ``peer_ip`` and ``peer_port`` (the *client* side of the connection).
-    A connection's info block is every line after its ``ESTAB`` header up
-    to the next header, so each flow is parsed in isolation — no cross-flow
-    contamination.
+
+    A *connection header* line is detected structurally — it is the only kind
+    of line carrying TWO address:port tokens (Local + Peer) — rather than by a
+    rigid ``^ESTAB ...`` anchor. This makes the split robust to the State
+    column, extra columns, and IPv4 vs IPv6-mapped/bracketed address forms.
+    The peer is the second token; the info block is every following line up to
+    the next header, so flows never contaminate one another.
     """
     flows = []
     cur_peer = None
@@ -96,10 +99,10 @@ def parse_ss_flows(raw):
             flows.append(metrics)
 
     for line in raw.splitlines():
-        conn = CONN_RE.match(line.strip())
-        if conn:
+        addrs = ADDR_RE.findall(line)
+        if len(addrs) >= 2:               # Local + Peer => a connection header
             flush()                       # close out the previous flow
-            cur_peer = (conn.group(3), conn.group(4))
+            cur_peer = (addrs[1][0], addrs[1][1])   # second token = peer/client
             info_lines = []
         elif cur_peer is not None:
             info_lines.append(line)       # part of the current flow's block
@@ -187,6 +190,7 @@ def run_sampler(interval_ms, duration_s, tcp_csv_path, queue_csv_path,
     log.info("Flow roles: attacker=%s honest=%s",
              attacker_ip or "<none>", honest_ip or "<none>")
     sample_count = 0
+    diag_saved = False          # dump raw ss once if parsing yields nothing
 
     try:
         while running:
@@ -199,6 +203,7 @@ def run_sampler(interval_ms, duration_s, tcp_csv_path, queue_csv_path,
             el = f"{elapsed:.3f}"
 
             # --- TCP state from ss: one row per established flow ---
+            ss_raw = ""
             try:
                 ss_raw = subprocess.check_output(
                     ["ss", "-tin", "state", "established", "sport", "=", ":80"],
@@ -207,6 +212,21 @@ def run_sampler(interval_ms, duration_s, tcp_csv_path, queue_csv_path,
                 flows = parse_ss_flows(ss_raw)
             except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
                 flows = []
+
+            # Safety net: if we saw socket info but parsed no flows, the ss
+            # address format is unexpected — dump it once so it can be fixed
+            # instead of silently producing an empty tcp_metrics.csv.
+            if not flows and "cwnd:" in ss_raw and not diag_saved:
+                dbg = os.path.join(os.path.dirname(tcp_csv_path) or ".",
+                                   "ss_raw_debug.txt")
+                try:
+                    with open(dbg, "w") as df:
+                        df.write(ss_raw)
+                    log.warning("Parsed 0 flows though cwnd is present — saved "
+                                "raw ss output to %s for inspection", dbg)
+                except OSError:
+                    pass
+                diag_saved = True
 
             sampled = []
             for metrics in flows:
