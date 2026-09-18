@@ -125,8 +125,19 @@ def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50):
 
     # ---------------------------------------------------------------
     # Bottleneck shaping on r1-eth1 (toward clients)
+    #
+    # NOTE: tbf is the root and netem is its CHILD. When tbf has a child
+    # qdisc, packets are held in the child, so tbf's own `limit` is ignored
+    # and the *child's* queue length governs the buffer. netem's default
+    # limit is 1000 packets — that hidden bufferbloat inflates RTT to ~1 s
+    # and cwnd to ~1000, drowning the loss signal the attack manipulates.
+    # We therefore set netem's `limit` explicitly to a shallow, realistic
+    # bottleneck buffer: the bandwidth-delay "pipe" plus queue_pkts of
+    # standing queue.
     # ---------------------------------------------------------------
     burst = max(bw_mbps * 1000 // 8, 1600)  # bytes, at least one MTU
+    delay_pipe_pkts = int((bw_mbps * 1e6 / 8) * (netem_delay / 1000.0) / 1500)
+    netem_limit = max(delay_pipe_pkts + queue_pkts, queue_pkts + 4)
     r1.cmd(f"tc qdisc del dev r1-eth1 root 2>/dev/null; true")
     r1.cmd(
         f"tc qdisc add dev r1-eth1 root handle 1: tbf "
@@ -134,10 +145,10 @@ def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50):
     )
     r1.cmd(
         f"tc qdisc add dev r1-eth1 parent 1: handle 10: netem "
-        f"delay {netem_delay}ms"
+        f"delay {netem_delay}ms limit {netem_limit}"
     )
-    info(f"*** Bottleneck: {bw_mbps} Mbps, {queue_pkts}-pkt queue, "
-         f"{netem_delay} ms one-way delay\n")
+    info(f"*** Bottleneck: {bw_mbps} Mbps, {netem_delay} ms one-way delay, "
+         f"buffer {netem_limit} pkts (~{queue_pkts}-pkt standing queue)\n")
 
     # Also shape the reverse direction (r1-eth0 toward h1) for RTT symmetry
     r1.cmd(f"tc qdisc del dev r1-eth0 root 2>/dev/null; true")
