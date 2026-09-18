@@ -11,9 +11,16 @@
 //       in the previous version and left the whole defense inert).
 //
 //   * xdp_ack_filter  (SEC "xdp", attached to h1-eth0 INGRESS)
-//       Inspects every incoming client ACK and enforces two invariants:
+//       Inspects every incoming client ACK and enforces three invariants:
 //         1. Sent-bound:  ack_no <= snd_max            (cannot ACK unsent data)
-//         2. Rate-bound:  ACK-advance rate <= B_path + margin  (token bucket)
+//         2. Time-bound:  ack_no <= snd_max(now - RTT_MIN)   (cannot ACK data
+//                         sent less than one min-RTT ago — a real receiver has
+//                         not physically received it yet). This is the check
+//                         that catches a *delivery-clocked* optimistic ACKer,
+//                         which stays under snd_max and paces at the path rate
+//                         (so it slips past checks 1 and 3) yet still ACKs
+//                         ahead of what it has received to compress the RTT.
+//         3. Rate-bound:  ACK-advance rate <= B_path + margin  (token bucket)
 //       Non-compliant ACKs are dropped before the kernel TCP stack sees them,
 //       so fabricated/optimistic ACKs cannot inflate the congestion window.
 //
@@ -59,6 +66,18 @@
 // burst (~one BDP) without penalty while still capping the sustained rate.
 #define BUCKET_MAX_BYTES  (128u * 1024u)
 
+// Time-bound parameters — the check that actually stops a delivery-clocked
+// optimistic ACKer. One-way path delay is 50 ms, so the MINIMUM physically
+// possible RTT is ~100 ms: an honest receiver cannot ACK a byte sooner than
+// 100 ms after the server sent it (50 ms out + 50 ms for the ACK back). We
+// set the floor a touch below that (90 ms) so a legitimate ACK is NEVER
+// dropped, while any ACK covering data sent < 90 ms ago is provably optimistic.
+// We reconstruct "snd_max as of (now - RTT_MIN)" from a small ring of egress
+// snapshots taken every SNAP_INTERVAL_NS.
+#define RTT_MIN_NS        90000000ULL   // 90 ms (< 100 ms physical RTT floor)
+#define SNAP_RING_SIZE    32            // power of two (index is masked)
+#define SNAP_INTERVAL_NS  5000000ULL    // 5 ms between snapshots (160 ms span)
+
 // ──────────────────────────────────────────────────────────────────────
 // Per-flow state.  Flow key is canonicalised to (client, server) in both
 // directions so the ingress ACK and the egress data map to the same entry.
@@ -78,7 +97,14 @@ struct flow_state {
     __u64 refill_ts;       // last token-bucket refill time (ns)
     __u32 drops_sent;      // ACKs dropped: sent-bound violation
     __u32 drops_rate;      // ACKs dropped: rate-bound violation
+    __u32 drops_time;      // ACKs dropped: time-bound violation
     __u32 total_acks;      // total ACKs seen for this flow
+    // Ring of egress snapshots for the time-bound check: ring_seq[i] was the
+    // value of snd_max at time ring_ts[i]. Parallel arrays avoid struct padding.
+    __u32 ring_seq[SNAP_RING_SIZE];
+    __u64 ring_ts[SNAP_RING_SIZE];
+    __u32 ring_head;       // next slot to write (masked by SNAP_RING_SIZE-1)
+    __u64 last_snap_ts;    // when the last snapshot was taken (ns)
 };
 
 // ──────────────────────────────────────────────────────────────────────
@@ -94,7 +120,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 6);
+    __uint(max_entries, 7);
     __type(key, __u32);
     __type(value, __u64);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
@@ -107,6 +133,7 @@ enum counter_idx {
     CNT_DROPS_RATE   = 3,
     CNT_EGRESS_PKTS  = 4,
     CNT_SND_UPDATES  = 5,
+    CNT_DROPS_TIME   = 6,
 };
 
 static __always_inline void inc_counter(__u32 idx) {
@@ -172,13 +199,19 @@ int tc_snd_tracker(struct __sk_buff *skb) {
         .server_port = tcp->source,
     };
 
+    __u64 now = bpf_ktime_get_ns();
+
     struct flow_state *st = bpf_map_lookup_elem(&flow_table, &key);
     if (!st) {
         struct flow_state ns = {
-            .snd_max    = seq_end,
-            .last_ack   = 0,
-            .tokens     = BUCKET_MAX_BYTES,
-            .refill_ts  = bpf_ktime_get_ns(),
+            .snd_max       = seq_end,
+            .last_ack      = 0,
+            .tokens        = BUCKET_MAX_BYTES,
+            .refill_ts     = now,
+            .ring_seq      = { seq_end },   // seed snapshot slot 0
+            .ring_ts       = { now },
+            .ring_head     = 1,
+            .last_snap_ts  = now,
         };
         bpf_map_update_elem(&flow_table, &key, &ns, BPF_ANY);
         inc_counter(CNT_SND_UPDATES);
@@ -188,6 +221,15 @@ int tc_snd_tracker(struct __sk_buff *skb) {
     if (seq_after(seq_end, st->snd_max)) {
         st->snd_max = seq_end;
         inc_counter(CNT_SND_UPDATES);
+    }
+
+    // Record a periodic snapshot of snd_max for the ingress time-bound check.
+    if (now - st->last_snap_ts >= SNAP_INTERVAL_NS) {
+        __u32 h = st->ring_head & (SNAP_RING_SIZE - 1);
+        st->ring_seq[h] = st->snd_max;
+        st->ring_ts[h]  = now;
+        st->ring_head   = h + 1;
+        st->last_snap_ts = now;
     }
     return TC_ACT_OK;
 }
@@ -265,7 +307,33 @@ int xdp_ack_filter(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    // ── CHECK 2: Rate-bound — token bucket on cumulative ACK advance ──
+    // ── CHECK 2: Time-bound — cannot ACK data sent < RTT_MIN ago ──────
+    // Reconstruct "snd_max as of (now - RTT_MIN)" from the egress snapshot
+    // ring: the newest snapshot whose timestamp is already older than the
+    // cutoff. If ack_no is beyond that, the client is claiming data that was
+    // put on the wire too recently to have physically arrived and been ACKed
+    // — i.e. an optimistic ACK. Honest ACKs (real RTT >= 100 ms > RTT_MIN)
+    // always fall at or below this bound, so they are never dropped.
+    if (now_ns > RTT_MIN_NS) {
+        __u64 cutoff = now_ns - RTT_MIN_NS;
+        __u64 best_ts = 0;
+        __u32 snd_max_delayed = 0;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < SNAP_RING_SIZE; i++) {
+            __u64 ts = state->ring_ts[i];
+            if (ts != 0 && ts <= cutoff && ts >= best_ts) {
+                best_ts = ts;
+                snd_max_delayed = state->ring_seq[i];
+            }
+        }
+        if (best_ts != 0 && seq_after(ack_no, snd_max_delayed)) {
+            state->drops_time++;
+            inc_counter(CNT_DROPS_TIME);
+            return XDP_DROP;
+        }
+    }
+
+    // ── CHECK 3: Rate-bound — token bucket on cumulative ACK advance ──
     // advance is measured from the last ACK we *accepted*, so dropping an
     // over-rate ACK genuinely holds snd_una back: the flow's ACK number can
     // only climb as fast as tokens refill (RATE_LIMIT_BPS). An optimistic

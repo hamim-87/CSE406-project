@@ -47,6 +47,7 @@ TC_PROG = "tc_snd_tracker"       # must match SEC/func name in the .c (<=15 char
 COUNTER_LABELS = [
     "total_pkts", "tcp_acks", "drops_sent_bound",
     "drops_rate_bound", "egress_pkts", "snd_max_updates",
+    "drops_time_bound",
 ]
 
 
@@ -198,9 +199,10 @@ def main():
             tick += 1
             if tick % max(1, int(round(1.0 / args.interval))) == 0 or args.interval >= 1:
                 stats = read_counters()
-                log.info("acks=%s | dropped sent-bound=%s rate-bound=%s | "
-                         "egress=%s snd_max_upd=%s | flows=%d",
+                log.info("acks=%s | dropped time-bound=%s sent-bound=%s "
+                         "rate-bound=%s | egress=%s snd_max_upd=%s | flows=%d",
                          stats.get("tcp_acks", "?"),
+                         stats.get("drops_time_bound", "?"),
                          stats.get("drops_sent_bound", "?"),
                          stats.get("drops_rate_bound", "?"),
                          stats.get("egress_pkts", "?"),
