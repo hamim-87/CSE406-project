@@ -61,7 +61,8 @@ def cleanup_namespaces(net):
             os.remove(dst)
 
 
-def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50):
+def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50,
+                   fair_queue=False):
     """
     Build and return the Mininet network with the dumbbell topology.
 
@@ -71,6 +72,10 @@ def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50):
     netem_delay: int   — One-way link delay in ms on the bottleneck
     bw_mbps    : int   — Bottleneck bandwidth in Mbps
     queue_pkts : int   — Bottleneck queue depth in packets
+    fair_queue : bool  — If True, use a per-flow fair queue (fq_codel) at the
+                         bottleneck instead of a single drop-tail FIFO. This is
+                         the DEFENSE mode: it stops an optimistic-ACK flow from
+                         starving the honest flow. Baseline/attack use False.
     """
     net = Mininet(switch=OVSBridge, link=TCLink)
 
@@ -143,12 +148,33 @@ def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50):
         f"tc qdisc add dev r1-eth1 root handle 1: tbf "
         f"rate {bw_mbps}mbit burst {burst} limit {queue_pkts * 1500}"
     )
-    r1.cmd(
-        f"tc qdisc add dev r1-eth1 parent 1: handle 10: netem "
-        f"delay {netem_delay}ms limit {netem_limit}"
-    )
-    info(f"*** Bottleneck: {bw_mbps} Mbps, {netem_delay} ms one-way delay, "
-         f"buffer {netem_limit} pkts (~{queue_pkts}-pkt standing queue)\n")
+    if fair_queue:
+        # DEFENSE bottleneck: netem supplies the propagation delay and
+        # fq_codel is its queue, so the two flows are scheduled *per-flow
+        # fairly* (deficit round-robin) with CoDel AQM. An optimistic-ACK
+        # flow may inflate its cwnd without limit, but fq_codel isolates it to
+        # its own sub-queue and drops its overflow there — it can no longer
+        # crowd the honest flow out of a shared FIFO. This is the mechanism
+        # that actually neutralises the attack (a server-side ACK filter
+        # cannot, because it can't see which packets the router dropped).
+        r1.cmd(
+            f"tc qdisc add dev r1-eth1 parent 1: handle 10: netem "
+            f"delay {netem_delay}ms limit 10240"
+        )
+        r1.cmd("tc qdisc add dev r1-eth1 parent 10: handle 100: fq_codel")
+        info(f"*** Bottleneck: {bw_mbps} Mbps, {netem_delay} ms one-way delay, "
+             f"FAIR per-flow queue (fq_codel) [DEFENSE]\n")
+    else:
+        # BASELINE/ATTACK bottleneck: one shared drop-tail FIFO. This single
+        # queue is precisely what lets an optimistic-ACK flood displace the
+        # honest flow's packets, so the attack works here as intended.
+        r1.cmd(
+            f"tc qdisc add dev r1-eth1 parent 1: handle 10: netem "
+            f"delay {netem_delay}ms limit {netem_limit}"
+        )
+        info(f"*** Bottleneck: {bw_mbps} Mbps, {netem_delay} ms one-way delay, "
+             f"drop-tail FIFO buffer {netem_limit} pkts "
+             f"(~{queue_pkts}-pkt standing queue)\n")
 
     # Also shape the reverse direction (r1-eth0 toward h1) for RTT symmetry
     r1.cmd(f"tc qdisc del dev r1-eth0 root 2>/dev/null; true")
@@ -205,6 +231,11 @@ def main():
                         help="Path to nginx.conf inside the Mininet host")
     parser.add_argument("--cli", action="store_true",
                         help="Drop into Mininet CLI after setup")
+    parser.add_argument("--fair", action="store_true",
+                        help="DEFENSE mode: use a per-flow fair queue "
+                             "(fq_codel) at the bottleneck instead of a "
+                             "drop-tail FIFO, neutralising the optimistic-ACK "
+                             "attack")
     args = parser.parse_args()
 
     setLogLevel("info")
@@ -213,6 +244,7 @@ def main():
         netem_delay=args.delay,
         bw_mbps=args.bw,
         queue_pkts=args.queue,
+        fair_queue=args.fair,
     )
 
     h1 = net.get("h1")

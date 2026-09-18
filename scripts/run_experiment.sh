@@ -247,16 +247,20 @@ run_defense() {
     log_step "═══ SCENARIO: DEFENSE (XDP filter active) ═══"
     local tag="defense_${CC_ALGO}"
 
-    # Compile BPF if not already done
-    if [[ ! -f "${DEFENSE_DIR}/defense_inspector.o" ]]; then
-        compile_bpf || {
-            log_error "Cannot run defense scenario without BPF object"
-            return 1
-        }
-    fi
+    # Always recompile the BPF object so edits to defense_inspector.c take
+    # effect. (The old "compile only if missing" check silently reused a stale
+    # object after every source edit.) The eBPF ACK filter is a complementary
+    # layer here; the fair queue (--fair below) is the PRIMARY defense, so a
+    # BPF build failure is non-fatal — the scenario still demonstrates it.
+    rm -f "${DEFENSE_DIR}/defense_inspector.o"
+    compile_bpf || log_warn "BPF build failed — continuing with fair-queue defense only"
 
+    # DEFENSE topology: per-flow fair queue (fq_codel) at the bottleneck.
+    # This is what actually stops the attack; baseline/attack omit --fair and
+    # therefore keep the drop-tail FIFO on which the attack succeeds.
     python3 "${SRC_DIR}/topology.py" \
         --cc "$CC_ALGO" --delay "$DELAY_MS" --bw "$BW_MBPS" --queue "$QUEUE_PKTS" \
+        --fair \
         --nginx-conf "${CONFIG_DIR}/nginx.conf" &
     local topo_pid=$!
     sleep 5
