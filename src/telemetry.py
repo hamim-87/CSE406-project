@@ -1,25 +1,4 @@
 #!/usr/bin/env python3
-"""
-telemetry.py — TCP & Queue State Sampler (runs on h1: server)
-CSE 406: Computer Security Lab Project
-
-Periodically samples:
-  1. Server TCP socket state via `ss -tin` — cwnd, ssthresh, RTT, retransmits
-  2. Bottleneck queue occupancy via `tc -s qdisc` on the router interface
-
-IMPORTANT — per-flow sampling
------------------------------
-The server holds *two* connections on port 80 at once during the attack
-scenario: the honest client and the optimistic-ACK attacker. A single
-`ss -ti sport = :80` therefore prints *both* flows, and grabbing "the first
-match" mixes them into an uninterpretable trace. This sampler instead splits
-the `ss` output into one block per connection, keyed by the peer address, and
-writes **one CSV row per flow per sample** with a `peer_ip`/`peer_port`/`role`
-tag. Downstream (plot_results.py) selects a flow by role, so the attacker's
-cwnd is never confused with the honest client's.
-
-Outputs time-series CSVs for offline analysis and plotting.
-"""
 
 import argparse
 import csv
@@ -38,16 +17,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("telemetry")
 
-
-# ──────────────────────────────────────────────────────────────────────
-# ss -ti parser: extracts key TCP metrics from socket info output
-# ──────────────────────────────────────────────────────────────────────
 SS_FIELDS = {
     "cwnd":       re.compile(r"cwnd:(\d+)"),
     "ssthresh":   re.compile(r"ssthresh:(\d+)"),
-    "rtt":        re.compile(r"rtt:(\d+(?:\.\d+)?)/"),       # rtt:value/var
+    "rtt":        re.compile(r"rtt:(\d+(?:\.\d+)?)/"),
     "rttvar":     re.compile(r"rtt:\d+(?:\.\d+)?/(\d+(?:\.\d+)?)"),
-    "retrans":    re.compile(r"retrans:\d+/(\d+)"),          # total retransmits
+    "retrans":    re.compile(r"retrans:\d+/(\d+)"),
     "bytes_sent": re.compile(r"bytes_sent:(\d+)"),
     "bytes_acked":re.compile(r"bytes_acked:(\d+)"),
     "send_rate":  re.compile(r"send (\d+(?:\.\d+)?[KMG]?bps)"),
@@ -55,38 +30,16 @@ SS_FIELDS = {
     "snd_wnd":    re.compile(r"snd_wnd:(\d+)"),
 }
 
-# An IPv4 address:port token as `ss` prints it, tolerating the forms that
-# actually occur on a dual-stack server. NGINX `listen 80` binds v6 too, so a
-# v4 client can appear IPv6-mapped and/or bracketed:
-#   10.0.1.2:80        [::ffff:10.0.1.2]:80        ::ffff:10.0.1.2:80
-# The optional leading '[', '::ffff:' and trailing ']' are stripped by the
-# regex so only the dotted-quad IPv4 and the port are captured.
 ADDR_RE = re.compile(r"\[?(?:::ffff:)?(\d+\.\d+\.\d+\.\d+)\]?:(\d+)")
 
-
 def parse_ss_output(raw):
-    """Parse one `ss -ti` info block and return a dict of TCP metrics."""
     metrics = {}
     for field, pattern in SS_FIELDS.items():
         match = pattern.search(raw)
         metrics[field] = match.group(1) if match else ""
     return metrics
 
-
 def parse_ss_flows(raw):
-    """
-    Split raw `ss -tin` output into one entry per established flow.
-
-    Returns a list of dicts, each with the parsed SS_FIELDS plus
-    ``peer_ip`` and ``peer_port`` (the *client* side of the connection).
-
-    A *connection header* line is detected structurally — it is the only kind
-    of line carrying TWO address:port tokens (Local + Peer) — rather than by a
-    rigid ``^ESTAB ...`` anchor. This makes the split robust to the State
-    column, extra columns, and IPv4 vs IPv6-mapped/bracketed address forms.
-    The peer is the second token; the info block is every following line up to
-    the next header, so flows never contaminate one another.
-    """
     flows = []
     cur_peer = None
     info_lines = []
@@ -100,19 +53,15 @@ def parse_ss_flows(raw):
 
     for line in raw.splitlines():
         addrs = ADDR_RE.findall(line)
-        if len(addrs) >= 2:               # Local + Peer => a connection header
-            flush()                       # close out the previous flow
-            cur_peer = (addrs[1][0], addrs[1][1])   # second token = peer/client
+        if len(addrs) >= 2:
+            flush()
+            cur_peer = (addrs[1][0], addrs[1][1])
             info_lines = []
         elif cur_peer is not None:
-            info_lines.append(line)       # part of the current flow's block
-    flush()                               # last flow
+            info_lines.append(line)
+    flush()
     return flows
 
-
-# ──────────────────────────────────────────────────────────────────────
-# tc -s qdisc parser: extracts queue stats
-# ──────────────────────────────────────────────────────────────────────
 TC_PATTERNS = {
     "sent_bytes":   re.compile(r"Sent (\d+) bytes"),
     "sent_pkts":    re.compile(r"Sent \d+ bytes (\d+) pkt"),
@@ -122,45 +71,22 @@ TC_PATTERNS = {
     "backlog_pkts": re.compile(r"backlog \d+b (\d+)p"),
 }
 
-
 def parse_tc_output(raw):
-    """Parse `tc -s qdisc` output and return queue statistics."""
     stats = {}
     for field, pattern in TC_PATTERNS.items():
         match = pattern.search(raw)
         stats[field] = match.group(1) if match else ""
     return stats
 
-
 def classify_peer(peer_ip, attacker_ip, honest_ip):
-    """Map a peer IP to a human-readable flow role."""
     if attacker_ip and peer_ip == attacker_ip:
         return "attacker"
     if honest_ip and peer_ip == honest_ip:
         return "honest"
     return "other"
 
-
-# ──────────────────────────────────────────────────────────────────────
-# Sampling loop
-# ──────────────────────────────────────────────────────────────────────
 def run_sampler(interval_ms, duration_s, tcp_csv_path, queue_csv_path,
                 router_iface, remote_ns_cmd, attacker_ip, honest_ip):
-    """
-    Main sampling loop that runs every `interval_ms` milliseconds.
-
-    Parameters
-    ----------
-    interval_ms    : int  — sampling period in milliseconds
-    duration_s     : int  — total sampling duration (0 = indefinite)
-    tcp_csv_path   : str  — output CSV for TCP metrics (one row per flow)
-    queue_csv_path : str  — output CSV for queue metrics
-    router_iface   : str  — interface name on router for tc stats
-    remote_ns_cmd  : str  — prefix to run tc inside the router namespace
-                            (e.g., "ip netns exec r1" or empty for same ns)
-    attacker_ip    : str  — peer IP to label as the "attacker" flow
-    honest_ip      : str  — peer IP to label as the "honest" flow
-    """
     os.makedirs(os.path.dirname(tcp_csv_path) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(queue_csv_path) or ".", exist_ok=True)
 
@@ -190,7 +116,7 @@ def run_sampler(interval_ms, duration_s, tcp_csv_path, queue_csv_path,
     log.info("Flow roles: attacker=%s honest=%s",
              attacker_ip or "<none>", honest_ip or "<none>")
     sample_count = 0
-    diag_saved = False          # dump raw ss once if parsing yields nothing
+    diag_saved = False
 
     try:
         while running:
@@ -202,7 +128,6 @@ def run_sampler(interval_ms, duration_s, tcp_csv_path, queue_csv_path,
             ts = f"{now:.3f}"
             el = f"{elapsed:.3f}"
 
-            # --- TCP state from ss: one row per established flow ---
             ss_raw = ""
             try:
                 ss_raw = subprocess.check_output(
@@ -213,9 +138,6 @@ def run_sampler(interval_ms, duration_s, tcp_csv_path, queue_csv_path,
             except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
                 flows = []
 
-            # Safety net: if we saw socket info but parsed no flows, the ss
-            # address format is unexpected — dump it once so it can be fixed
-            # instead of silently producing an empty tcp_metrics.csv.
             if not flows and "cwnd:" in ss_raw and not diag_saved:
                 dbg = os.path.join(os.path.dirname(tcp_csv_path) or ".",
                                    "ss_raw_debug.txt")
@@ -236,7 +158,6 @@ def run_sampler(interval_ms, duration_s, tcp_csv_path, queue_csv_path,
                 tcp_writer.writerow(row)
                 sampled.append((role, metrics))
 
-            # --- Queue state from tc ---
             try:
                 tc_cmd = f"{remote_ns_cmd} tc -s qdisc show dev {router_iface}".split()
                 tc_raw = subprocess.check_output(tc_cmd, text=True, timeout=2)
@@ -252,7 +173,6 @@ def run_sampler(interval_ms, duration_s, tcp_csv_path, queue_csv_path,
             if sample_count % max(1, 5000 // interval_ms) == 0:
                 tcp_file.flush()
                 queue_file.flush()
-                # Summarize each flow's cwnd rather than an arbitrary one.
                 flow_summary = " ".join(
                     f"{role}:cwnd={m.get('cwnd', '?') or '-'}"
                     for role, m in sampled
@@ -262,7 +182,6 @@ def run_sampler(interval_ms, duration_s, tcp_csv_path, queue_csv_path,
                          queue_stats.get("backlog_pkts", "?"),
                          queue_stats.get("dropped", "?"))
 
-            # Tight sleep to honor the sampling interval
             sleep_until = now + interval_s
             remaining = sleep_until - time.monotonic()
             if remaining > 0:
@@ -273,7 +192,6 @@ def run_sampler(interval_ms, duration_s, tcp_csv_path, queue_csv_path,
         queue_file.close()
         log.info("Sampling complete: %d samples in %.1f s",
                  sample_count, time.monotonic() - start)
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -308,7 +226,6 @@ def main():
         attacker_ip=args.attacker_ip,
         honest_ip=args.honest_ip,
     )
-
 
 if __name__ == "__main__":
     main()

@@ -1,40 +1,25 @@
 #!/usr/bin/env bash
-# run_experiment.sh — Orchestrates baseline and attack experiments
-# CSE 406: Computer Security Lab Project
-#
-# Usage:
-#   sudo ./scripts/run_experiment.sh [baseline|attack|defense|all]
-#
-# Prerequisites:
-#   - Mininet, Scapy, NGINX, bpftool, clang (for BPF) installed
-#   - Run as root (Mininet requires it)
 
 set -euo pipefail
 
-# ──────────────────────────────────────────────────────────────────
-# Configuration
-# ──────────────────────────────────────────────────────────────────
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_DIR="${PROJECT_DIR}/src"
 DEFENSE_DIR="${PROJECT_DIR}/defense"
 CONFIG_DIR="${PROJECT_DIR}/config"
 RESULTS_DIR="/tmp/cse406/results"
 LOGS_DIR="/tmp/cse406/logs"
-DURATION=60          # seconds per scenario
-CC_ALGO="cubic"      # congestion control: cubic or reno
-DELAY_MS=50          # one-way bottleneck delay
-BW_MBPS=10           # bottleneck bandwidth
-QUEUE_PKTS=50        # bottleneck queue depth
+DURATION=60
+CC_ALGO="cubic"
+DELAY_MS=50
+BW_MBPS=10
+QUEUE_PKTS=50
 
-# Optimistic ACK parameters (paced attacker)
-OPT_TARGET_BW=20     # bandwidth to steal via optimistic ACKing (Mbps, ~2x path)
-OPT_MULTIPLIER=2.0   # max optimistic lead as a multiple of BDP
+OPT_TARGET_BW=20
+OPT_MULTIPLIER=2.0
 
-# Client peer IPs (as the server sees them) — used to tag telemetry flows
 ATTACKER_IP=10.0.0.3
 HONEST_IP=10.0.0.2
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -46,9 +31,6 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 log_step()  { echo -e "${BLUE}[STEP]${NC}  $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
-# ──────────────────────────────────────────────────────────────────
-# Pre-flight checks
-# ──────────────────────────────────────────────────────────────────
 preflight() {
     if [[ $EUID -ne 0 ]]; then
         log_error "This script must be run as root (Mininet requirement)"
@@ -67,9 +49,6 @@ preflight() {
     log_info "Logs directory:    $LOGS_DIR"
 }
 
-# ──────────────────────────────────────────────────────────────────
-# Generate test video file if missing
-# ──────────────────────────────────────────────────────────────────
 ensure_video() {
     if [[ ! -f /var/www/video.mp4 ]]; then
         log_step "Generating 200 MB test video file..."
@@ -79,9 +58,6 @@ ensure_video() {
     fi
 }
 
-# ──────────────────────────────────────────────────────────────────
-# Compile BPF defense module
-# ──────────────────────────────────────────────────────────────────
 compile_bpf() {
     log_step "Compiling eBPF defense module..."
     if ! command -v clang &>/dev/null; then
@@ -95,46 +71,32 @@ compile_bpf() {
     log_info "BPF object compiled: ${DEFENSE_DIR}/defense_inspector.o"
 }
 
-# ──────────────────────────────────────────────────────────────────
-# Cleanup function
-# ──────────────────────────────────────────────────────────────────
 cleanup() {
     log_step "Cleaning up..."
-    # Kill any background processes we started
     jobs -p 2>/dev/null | xargs -r kill 2>/dev/null || true
-    # Stop Mininet
     mn -c 2>/dev/null || true
     log_info "Cleanup complete"
 }
 trap cleanup EXIT
 
-# ──────────────────────────────────────────────────────────────────
-# Scenario: BASELINE (honest client only, no attack)
-# ──────────────────────────────────────────────────────────────────
 run_baseline() {
     log_step "═══ SCENARIO: BASELINE (no attack) ═══"
     local tag="baseline_${CC_ALGO}"
 
-    # Start Mininet topology in background
     python3 "${SRC_DIR}/topology.py" \
         --cc "$CC_ALGO" --delay "$DELAY_MS" --bw "$BW_MBPS" --queue "$QUEUE_PKTS" \
         --nginx-conf "${CONFIG_DIR}/nginx.conf" &
     local topo_pid=$!
-    sleep 5  # wait for topology + NGINX
+    sleep 5
 
-    # Start telemetry on h1
     log_step "Starting telemetry sampler..."
 
-    # Use ip netns exec to run commands on Mininet hosts
     python3 -c "
 import time, subprocess, os, sys
 sys.path.insert(0, '${SRC_DIR}')
 
-# We connect to the running Mininet via its API
-# For the lab, we run components directly in the Mininet namespace
 os.system('mkdir -p ${RESULTS_DIR}/${tag}')
 
-# Run telemetry on h1
 subprocess.Popen([
     'ip', 'netns', 'exec', 'h1',
     'python3', '${SRC_DIR}/telemetry.py',
@@ -148,7 +110,6 @@ subprocess.Popen([
     '--honest-ip', '${HONEST_IP}',
 ])
 
-# Run honest client on h3
 time.sleep(2)
 subprocess.Popen([
     'ip', 'netns', 'exec', 'h3',
@@ -168,9 +129,6 @@ time.sleep(${DURATION} + 5)
     log_info "Baseline results saved to ${RESULTS_DIR}/${tag}/"
 }
 
-# ──────────────────────────────────────────────────────────────────
-# Scenario: ATTACK (optimistic ACK + honest client)
-# ──────────────────────────────────────────────────────────────────
 run_attack() {
     log_step "═══ SCENARIO: ATTACK (optimistic ACKing) ═══"
     local tag="attack_${CC_ALGO}"
@@ -185,7 +143,6 @@ run_attack() {
 import time, subprocess, os
 os.makedirs('${RESULTS_DIR}/${tag}', exist_ok=True)
 
-# Telemetry on h1
 telem = subprocess.Popen([
     'ip', 'netns', 'exec', 'h1',
     'python3', '${SRC_DIR}/telemetry.py',
@@ -201,7 +158,6 @@ telem = subprocess.Popen([
 
 time.sleep(2)
 
-# Honest client on h3 (starts first to establish baseline flow)
 honest = subprocess.Popen([
     'ip', 'netns', 'exec', 'h3',
     'python3', '${SRC_DIR}/honest_client.py',
@@ -210,9 +166,8 @@ honest = subprocess.Popen([
     '--duration', '${DURATION}',
 ])
 
-time.sleep(5)  # let honest flow stabilize
+time.sleep(5)
 
-# Optimistic ACK attacker on h2 (adaptive)
 attacker = subprocess.Popen([
     'ip', 'netns', 'exec', 'h2',
     'python3', '${SRC_DIR}/optimistic_client.py',
@@ -240,24 +195,13 @@ for p in [telem, honest, attacker]:
     log_info "Attack results saved to ${RESULTS_DIR}/${tag}/"
 }
 
-# ──────────────────────────────────────────────────────────────────
-# Scenario: DEFENSE (attack + XDP filter active)
-# ──────────────────────────────────────────────────────────────────
 run_defense() {
     log_step "═══ SCENARIO: DEFENSE (XDP filter active) ═══"
     local tag="defense_${CC_ALGO}"
 
-    # Always recompile the BPF object so edits to defense_inspector.c take
-    # effect. (The old "compile only if missing" check silently reused a stale
-    # object after every source edit.) The eBPF ACK filter is a complementary
-    # layer here; the fair queue (--fair below) is the PRIMARY defense, so a
-    # BPF build failure is non-fatal — the scenario still demonstrates it.
     rm -f "${DEFENSE_DIR}/defense_inspector.o"
     compile_bpf || log_warn "BPF build failed — continuing with fair-queue defense only"
 
-    # DEFENSE topology: per-flow fair queue (fq_codel) at the bottleneck.
-    # This is what actually stops the attack; baseline/attack omit --fair and
-    # therefore keep the drop-tail FIFO on which the attack succeeds.
     python3 "${SRC_DIR}/topology.py" \
         --cc "$CC_ALGO" --delay "$DELAY_MS" --bw "$BW_MBPS" --queue "$QUEUE_PKTS" \
         --fair \
@@ -269,7 +213,6 @@ run_defense() {
 import time, subprocess, os
 os.makedirs('${RESULTS_DIR}/${tag}', exist_ok=True)
 
-# Load XDP defense on h1
 defense = subprocess.Popen([
     'ip', 'netns', 'exec', 'h1',
     'python3', '${DEFENSE_DIR}/defense_loader.py',
@@ -281,7 +224,6 @@ defense = subprocess.Popen([
 
 time.sleep(2)
 
-# Telemetry on h1
 telem = subprocess.Popen([
     'ip', 'netns', 'exec', 'h1',
     'python3', '${SRC_DIR}/telemetry.py',
@@ -297,7 +239,6 @@ telem = subprocess.Popen([
 
 time.sleep(2)
 
-# Honest client on h3
 honest = subprocess.Popen([
     'ip', 'netns', 'exec', 'h3',
     'python3', '${SRC_DIR}/honest_client.py',
@@ -308,7 +249,6 @@ honest = subprocess.Popen([
 
 time.sleep(5)
 
-# Optimistic ACK attacker on h2 (adaptive)
 attacker = subprocess.Popen([
     'ip', 'netns', 'exec', 'h2',
     'python3', '${SRC_DIR}/optimistic_client.py',
@@ -336,9 +276,6 @@ for p in [defense, telem, honest, attacker]:
     log_info "Defense results saved to ${RESULTS_DIR}/${tag}/"
 }
 
-# ──────────────────────────────────────────────────────────────────
-# Results summary
-# ──────────────────────────────────────────────────────────────────
 print_summary() {
     echo ""
     log_step "═══ EXPERIMENT RESULTS SUMMARY ═══"
@@ -349,7 +286,6 @@ print_summary() {
         echo -e "${BLUE}--- ${scenario} ---${NC}"
 
         if [[ -f "${scenario_dir}/honest_throughput.csv" ]]; then
-            # Calculate average throughput from CSV
             avg=$(python3 -c "
 import csv
 vals = []
@@ -400,9 +336,6 @@ else:
     log_info "Experiment logs in: ${LOGS_DIR}/"
 }
 
-# ──────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────
 main() {
     local scenario="${1:-all}"
 

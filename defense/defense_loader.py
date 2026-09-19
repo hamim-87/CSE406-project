@@ -1,26 +1,4 @@
 #!/usr/bin/env python3
-"""
-defense_loader.py — eBPF Program Loader (XDP ingress + TC egress)
-CSE 406: Computer Security Lab Project
-
-Loads defense_inspector.o and attaches both of its programs to the server's
-interface so they share one flow_table map:
-
-  * xdp_ack_filter  → XDP on ingress  (filters incoming client ACKs)
-  * tc_snd_tracker  → TC clsact egress (learns snd_max from outgoing data)
-
-snd_max is now maintained entirely in the datapath by the egress program.
-The previous version tried to push snd_max in from userspace by parsing `ss`
-and writing a *partial* value with `bpftool map update` — the byte count
-never matched the 48-byte flow_state, so every update silently failed and the
-sent-bound check saw snd_max == 0 forever (the defense did nothing). That
-whole path is gone.
-
-Map sharing across the two hooks is achieved by loading the object once with
-`bpftool prog loadall ... pinmaps <dir>` (maps are declared LIBBPF_PIN_BY_NAME
-in the C), then attaching each pinned program. This is the piece that is
-easy to get wrong on a fresh VM, so it is done explicitly and checked.
-"""
 
 import argparse
 import json
@@ -41,8 +19,8 @@ log = logging.getLogger("defense_loader")
 
 BPFFS = "/sys/fs/bpf"
 PIN_DIR = "/sys/fs/bpf/cse406_defense"
-XDP_PROG = "xdp_ack_filter"      # must match SEC/func name in the .c (<=15 chars)
-TC_PROG = "tc_snd_tracker"       # must match SEC/func name in the .c (<=15 chars)
+XDP_PROG = "xdp_ack_filter"
+TC_PROG = "tc_snd_tracker"
 
 COUNTER_LABELS = [
     "total_pkts", "tcp_acks", "drops_sent_bound",
@@ -50,9 +28,7 @@ COUNTER_LABELS = [
     "drops_time_bound",
 ]
 
-
 def run(cmd, check=True, quiet=False):
-    """Run a command, logging failures. Returns CompletedProcess."""
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0 and not quiet:
         log.error("cmd failed (%d): %s", res.returncode, " ".join(cmd))
@@ -62,29 +38,21 @@ def run(cmd, check=True, quiet=False):
         sys.exit(1)
     return res
 
-
 def ensure_bpffs():
-    """Make sure the BPF filesystem is mounted (needed for map pinning)."""
     if not os.path.ismount(BPFFS):
         os.makedirs(BPFFS, exist_ok=True)
         run(["mount", "-t", "bpf", "none", BPFFS])
         log.info("Mounted bpffs at %s", BPFFS)
 
-
 def load_and_attach(iface, obj_path, xdp_mode):
-    """Load both programs with shared maps and attach them to `iface`."""
     if not os.path.exists(obj_path):
         log.error("BPF object not found: %s (compile it first)", obj_path)
         sys.exit(1)
 
     ensure_bpffs()
 
-    # Clean any prior state so a re-run starts fresh.
     detach(iface, quiet=True)
 
-    # Load the whole object once; pin every program and map under PIN_DIR.
-    # Sharing the pinned maps is what lets the egress tracker's snd_max reach
-    # the ingress filter.
     run(["bpftool", "prog", "loadall", obj_path, PIN_DIR, "pinmaps", PIN_DIR])
     log.info("Loaded %s (progs + maps pinned under %s)", obj_path, PIN_DIR)
 
@@ -97,34 +65,27 @@ def load_and_attach(iface, obj_path, xdp_mode):
             detach(iface, quiet=True)
             sys.exit(1)
 
-    # Attach XDP (ingress) from the pinned program.
     run(["ip", "link", "set", "dev", iface, f"xdp{xdp_mode}",
          "pinned", xdp_pin])
     log.info("XDP filter attached on %s ingress (mode=%s)", iface, xdp_mode)
 
-    # Attach TC (egress) from the pinned program via a clsact qdisc.
     run(["tc", "qdisc", "add", "dev", iface, "clsact"], check=False, quiet=True)
     run(["tc", "filter", "add", "dev", iface, "egress",
          "bpf", "da", "pinned", tc_pin])
     log.info("TC snd_max tracker attached on %s egress", iface)
 
-
 def detach(iface, quiet=False):
-    """Remove both programs and all pinned state."""
     subprocess.run(["ip", "link", "set", "dev", iface, "xdpgeneric", "off"],
                    capture_output=True)
     subprocess.run(["ip", "link", "set", "dev", iface, "xdp", "off"],
                    capture_output=True)
-    # Deleting the clsact qdisc removes the egress filter with it.
     subprocess.run(["tc", "qdisc", "del", "dev", iface, "clsact"],
                    capture_output=True)
     subprocess.run(["rm", "-rf", PIN_DIR], capture_output=True)
     if not quiet:
         log.info("Detached XDP/TC programs and removed pins from %s", iface)
 
-
 def read_counters():
-    """Read the global counters from the pinned BPF array map."""
     values = {}
     pin = os.path.join(PIN_DIR, "counters")
     try:
@@ -144,9 +105,7 @@ def read_counters():
         pass
     return values
 
-
 def count_flows():
-    """Return the number of entries currently in the flow_table map."""
     pin = os.path.join(PIN_DIR, "flow_table")
     try:
         raw = subprocess.check_output(
@@ -156,7 +115,6 @@ def count_flows():
         return len(json.loads(raw))
     except Exception:
         return 0
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -175,8 +133,6 @@ def main():
                         help="Detach programs and exit")
     args = parser.parse_args()
 
-    # `ip link set ... xdpgeneric` is the veth-friendly generic mode; accept
-    # the old "skb" spelling as an alias for it.
     xdp_mode = "generic" if args.mode in ("generic", "skb") else args.mode
 
     if args.unload:
@@ -212,7 +168,6 @@ def main():
     finally:
         detach(args.iface)
         log.info("Defense module stopped cleanly")
-
 
 if __name__ == "__main__":
     main()

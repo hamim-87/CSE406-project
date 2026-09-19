@@ -1,19 +1,4 @@
 #!/usr/bin/env python3
-"""
-topology.py — Mininet Dumbbell Testbed for TCP Optimistic-ACK Analysis
-CSE 406: Computer Security Lab Project
-
-Topology:
-    h1 (NGINX server 10.0.0.1)
-      |
-     r1 (router / bottleneck shaper)
-      |  tc tbf 10 Mbps, netem delay
-     s1 (OVS switch, 100 Mbps links)
-    /  \
-   h2   h3
- (attacker  (honest
-  10.0.0.3)  10.0.0.2)
-"""
 
 import argparse
 import os
@@ -26,9 +11,7 @@ from mininet.link import TCLink
 from mininet.log import setLogLevel, info
 from mininet.cli import CLI
 
-
 class LinuxRouter(Node):
-    """A node configured as a Linux IP router with forwarding enabled."""
 
     def config(self, **params):
         super().config(**params)
@@ -38,10 +21,7 @@ class LinuxRouter(Node):
         self.cmd("sysctl -w net.ipv4.ip_forward=0")
         super().terminate()
 
-
 def expose_namespaces(net):
-    """Symlink each host's netns into /var/run/netns/ so that
-    'ip netns exec <name>' works from outside Mininet."""
     ns_dir = "/var/run/netns"
     os.makedirs(ns_dir, exist_ok=True)
     for host in net.hosts:
@@ -52,68 +32,39 @@ def expose_namespaces(net):
         os.symlink(src, dst)
     info("*** Network namespaces exposed for ip netns exec\n")
 
-
 def cleanup_namespaces(net):
-    """Remove the symlinks created by expose_namespaces."""
     for host in net.hosts:
         dst = f"/var/run/netns/{host.name}"
         if os.path.islink(dst):
             os.remove(dst)
 
-
 def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50,
                    fair_queue=False):
-    """
-    Build and return the Mininet network with the dumbbell topology.
-
-    Parameters
-    ----------
-    cc_algo    : str   — TCP congestion control algorithm (cubic / reno)
-    netem_delay: int   — One-way link delay in ms on the bottleneck
-    bw_mbps    : int   — Bottleneck bandwidth in Mbps
-    queue_pkts : int   — Bottleneck queue depth in packets
-    fair_queue : bool  — If True, use a per-flow fair queue (fq_codel) at the
-                         bottleneck instead of a single drop-tail FIFO. This is
-                         the DEFENSE mode: it stops an optimistic-ACK flow from
-                         starving the honest flow. Baseline/attack use False.
-    """
     net = Mininet(switch=OVSBridge, link=TCLink)
 
-    # --- Hosts ---
-    h1 = net.addHost("h1", ip="10.0.0.1/24")       # NGINX media server
-    h2 = net.addHost("h2", ip="10.0.0.3/24")        # Optimistic ACK generator
-    h3 = net.addHost("h3", ip="10.0.0.2/24")        # Honest download client
+    h1 = net.addHost("h1", ip="10.0.0.1/24")
+    h2 = net.addHost("h2", ip="10.0.0.3/24")
+    h3 = net.addHost("h3", ip="10.0.0.2/24")
 
-    # --- Router (bottleneck shaper) ---
     r1 = net.addHost("r1", cls=LinuxRouter, ip="10.0.1.1/24")
 
-    # --- Switch ---
     s1 = net.addSwitch("s1")
 
-    # --- Links ---
-    # h1 <-> r1: 100 Mbps, no shaping (the shaping is applied via tc later)
     net.addLink(h1, r1, intfName1="h1-eth0", intfName2="r1-eth0",
                 params1={"ip": "10.0.1.2/24"},
                 params2={"ip": "10.0.1.1/24"},
                 bw=100)
 
-    # r1 <-> s1: this is the bottleneck link — raw link is 100 Mbps,
-    # but tc tbf will shape it to bw_mbps
     net.addLink(r1, s1, intfName1="r1-eth1", intfName2="s1-eth1",
                 params1={"ip": "10.0.0.254/24"},
                 bw=100)
 
-    # s1 <-> h2, h3: 100 Mbps access links
     net.addLink(s1, h2, intfName2="h2-eth0", bw=100)
     net.addLink(s1, h3, intfName2="h3-eth0", bw=100)
 
     net.start()
     expose_namespaces(net)
 
-    # ---------------------------------------------------------------
-    # Fix interface IPs — Mininet 2.2.x ignores params1/params2 IP
-    # overrides in addLink, so set them explicitly after start.
-    # ---------------------------------------------------------------
     h1.cmd("ip addr flush dev h1-eth0")
     h1.cmd("ip addr add 10.0.1.2/24 dev h1-eth0")
     r1.cmd("ip addr flush dev r1-eth0")
@@ -121,26 +72,11 @@ def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50,
     r1.cmd("ip addr flush dev r1-eth1")
     r1.cmd("ip addr add 10.0.0.254/24 dev r1-eth1")
 
-    # ---------------------------------------------------------------
-    # Routing: clients reach h1 via r1
-    # ---------------------------------------------------------------
     h1.cmd("ip route add 10.0.0.0/24 via 10.0.1.1")
     h2.cmd("ip route add 10.0.1.0/24 via 10.0.0.254")
     h3.cmd("ip route add 10.0.1.0/24 via 10.0.0.254")
 
-    # ---------------------------------------------------------------
-    # Bottleneck shaping on r1-eth1 (toward clients)
-    #
-    # NOTE: tbf is the root and netem is its CHILD. When tbf has a child
-    # qdisc, packets are held in the child, so tbf's own `limit` is ignored
-    # and the *child's* queue length governs the buffer. netem's default
-    # limit is 1000 packets — that hidden bufferbloat inflates RTT to ~1 s
-    # and cwnd to ~1000, drowning the loss signal the attack manipulates.
-    # We therefore set netem's `limit` explicitly to a shallow, realistic
-    # bottleneck buffer: the bandwidth-delay "pipe" plus queue_pkts of
-    # standing queue.
-    # ---------------------------------------------------------------
-    burst = max(bw_mbps * 1000 // 8, 1600)  # bytes, at least one MTU
+    burst = max(bw_mbps * 1000 // 8, 1600)
     delay_pipe_pkts = int((bw_mbps * 1e6 / 8) * (netem_delay / 1000.0) / 1500)
     netem_limit = max(delay_pipe_pkts + queue_pkts, queue_pkts + 4)
     r1.cmd(f"tc qdisc del dev r1-eth1 root 2>/dev/null; true")
@@ -149,14 +85,6 @@ def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50,
         f"rate {bw_mbps}mbit burst {burst} limit {queue_pkts * 1500}"
     )
     if fair_queue:
-        # DEFENSE bottleneck: netem supplies the propagation delay and
-        # fq_codel is its queue, so the two flows are scheduled *per-flow
-        # fairly* (deficit round-robin) with CoDel AQM. An optimistic-ACK
-        # flow may inflate its cwnd without limit, but fq_codel isolates it to
-        # its own sub-queue and drops its overflow there — it can no longer
-        # crowd the honest flow out of a shared FIFO. This is the mechanism
-        # that actually neutralises the attack (a server-side ACK filter
-        # cannot, because it can't see which packets the router dropped).
         r1.cmd(
             f"tc qdisc add dev r1-eth1 parent 1: handle 10: netem "
             f"delay {netem_delay}ms limit 10240"
@@ -165,9 +93,6 @@ def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50,
         info(f"*** Bottleneck: {bw_mbps} Mbps, {netem_delay} ms one-way delay, "
              f"FAIR per-flow queue (fq_codel) [DEFENSE]\n")
     else:
-        # BASELINE/ATTACK bottleneck: one shared drop-tail FIFO. This single
-        # queue is precisely what lets an optimistic-ACK flood displace the
-        # honest flow's packets, so the attack works here as intended.
         r1.cmd(
             f"tc qdisc add dev r1-eth1 parent 1: handle 10: netem "
             f"delay {netem_delay}ms limit {netem_limit}"
@@ -176,24 +101,17 @@ def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50,
              f"drop-tail FIFO buffer {netem_limit} pkts "
              f"(~{queue_pkts}-pkt standing queue)\n")
 
-    # Also shape the reverse direction (r1-eth0 toward h1) for RTT symmetry
     r1.cmd(f"tc qdisc del dev r1-eth0 root 2>/dev/null; true")
     r1.cmd(
         f"tc qdisc add dev r1-eth0 root handle 2: netem "
         f"delay {netem_delay}ms"
     )
 
-    # ---------------------------------------------------------------
-    # TCP congestion control on the server
-    # ---------------------------------------------------------------
     h1.cmd(f"sysctl -w net.ipv4.tcp_congestion_control={cc_algo}")
     h1.cmd("sysctl -w net.ipv4.tcp_no_metrics_save=1")
     h1.cmd("sysctl -w net.ipv4.tcp_moderate_rcvbuf=1")
     info(f"*** Server CC algorithm: {cc_algo}\n")
 
-    # ---------------------------------------------------------------
-    # RST suppression on h2 so user-space Scapy ACKs work
-    # ---------------------------------------------------------------
     h2.cmd(
         "iptables -A OUTPUT -p tcp --tcp-flags RST RST "
         "-s 10.0.0.3 -j DROP"
@@ -202,9 +120,7 @@ def build_topology(cc_algo="cubic", netem_delay=50, bw_mbps=10, queue_pkts=50,
 
     return net
 
-
 def start_nginx(host, config_path, video_path="/var/www/video.mp4"):
-    """Start NGINX on the given host with the provided configuration."""
     host.cmd("mkdir -p /var/www")
     if not os.path.exists(video_path):
         host.cmd(f"dd if=/dev/urandom of={video_path} bs=1M count=200 2>/dev/null &")
@@ -213,7 +129,6 @@ def start_nginx(host, config_path, video_path="/var/www/video.mp4"):
     host.cmd(f"nginx -c {config_path}")
     time.sleep(1)
     info("*** NGINX started on h1:80\n")
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -264,7 +179,6 @@ def main():
     h1.cmd("nginx -s stop 2>/dev/null; true")
     cleanup_namespaces(net)
     net.stop()
-
 
 if __name__ == "__main__":
     main()

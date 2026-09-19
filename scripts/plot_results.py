@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""
-plot_results.py — Generate comparison plots from experiment CSVs
-CSE 406: Computer Security Lab Project
-
-Produces:
-  1. Honest client goodput over time (baseline vs attack vs defense)
-  2. Server cwnd over time (baseline vs attack vs defense)
-  3. Queue occupancy over time
-  4. Summary bar chart
-"""
 
 import argparse
 import csv
@@ -24,9 +14,7 @@ except ImportError:
     print("matplotlib required: pip install matplotlib")
     sys.exit(1)
 
-
 def load_csv(path, fields):
-    """Load specified fields from a CSV file, returning {field: [values]}."""
     data = {f: [] for f in fields}
     if not os.path.exists(path):
         return data
@@ -40,9 +28,7 @@ def load_csv(path, fields):
                     data[field].append(0.0)
     return data
 
-
 def plot_throughput(results_dir, output_dir):
-    """Plot honest client goodput across scenarios."""
     fig, ax = plt.subplots(figsize=(10, 5))
 
     scenarios = {
@@ -69,9 +55,7 @@ def plot_throughput(results_dir, output_dir):
     plt.close(fig)
     print(f"  → {output_dir}/throughput_comparison.png")
 
-
 def load_flow_cwnd(path, role):
-    """Load (elapsed_s, cwnd) for one flow role from a per-flow tcp CSV."""
     xs, ys = [], []
     if not os.path.exists(path):
         return xs, ys
@@ -86,16 +70,7 @@ def load_flow_cwnd(path, role):
                 pass
     return xs, ys
 
-
 def plot_cwnd(results_dir, output_dir):
-    """
-    Plot the server's per-flow cwnd across scenarios.
-
-    Each flow is drawn separately (honest = solid, attacker = dashed), keyed
-    off the telemetry ``role`` column. This is what makes the attacker's
-    window inflation distinguishable from the honest client's — the old
-    single-line plot mixed both flows into one uninterpretable trace.
-    """
     fig, ax = plt.subplots(figsize=(10, 5))
 
     scenarios = {
@@ -103,7 +78,6 @@ def plot_cwnd(results_dir, output_dir):
         "attack_cubic":   ("Attack", "#F44336"),
         "defense_cubic":  ("Defense", "#4CAF50"),
     }
-    # role -> (linestyle, legend suffix)
     roles = {"honest": ("-", "honest"), "attacker": ("--", "attacker")}
 
     plotted = False
@@ -132,9 +106,7 @@ def plot_cwnd(results_dir, output_dir):
     plt.close(fig)
     print(f"  → {output_dir}/cwnd_comparison.png")
 
-
 def plot_queue(results_dir, output_dir):
-    """Plot bottleneck queue occupancy."""
     fig, ax = plt.subplots(figsize=(10, 5))
 
     scenarios = {
@@ -162,9 +134,7 @@ def plot_queue(results_dir, output_dir):
     plt.close(fig)
     print(f"  → {output_dir}/queue_comparison.png")
 
-
 def plot_summary_bars(results_dir, output_dir):
-    """Bar chart comparing average goodput across scenarios."""
     scenarios = ["baseline_cubic", "attack_cubic", "defense_cubic"]
     labels = ["Baseline", "Attack", "Defense"]
     colors = ["#2196F3", "#F44336", "#4CAF50"]
@@ -192,7 +162,6 @@ def plot_summary_bars(results_dir, output_dir):
     plt.close(fig)
     print(f"  → {output_dir}/summary_comparison.png")
 
-
 def main():
     parser = argparse.ArgumentParser(description="Plot experiment results")
     parser.add_argument("--results", default="/tmp/cse406/results",
@@ -210,7 +179,6 @@ def main():
     plot_summary_bars(args.results, args.output)
 
     print(f"\nAll plots saved to: {args.output}/")
-
 
 if __name__ == "__main__":
     main()

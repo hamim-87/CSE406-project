@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-honest_client.py — Legitimate HTTP Download Client (runs on h3: 10.0.0.2)
-CSE 406: Computer Security Lab Project
-
-Performs a standard HTTP GET for video.mp4 from the NGINX server and logs
-throughput samples every second. Used to measure the collateral impact of
-optimistic ACKing on competing honest flows.
-"""
 
 import argparse
 import csv
@@ -24,19 +16,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("honest_client")
 
-CHUNK_SIZE = 65536  # 64 KB read chunks
-
+CHUNK_SIZE = 65536
 
 def download_with_telemetry(url, output_csv, duration):
-    """
-    Download a file via HTTP and log per-second throughput to CSV.
-
-    Parameters
-    ----------
-    url        : str  — full URL to download
-    output_csv : str  — path for the throughput log CSV
-    duration   : int  — maximum download time in seconds (0 = unlimited)
-    """
     log.info("Starting download: %s", url)
     log.info("Throughput log: %s", output_csv)
 
@@ -106,7 +88,6 @@ def download_with_telemetry(url, output_csv, duration):
             log.info("Duration:       %.1f s", total_elapsed)
             log.info("Avg goodput:    %.2f Mbps", avg_mbps)
 
-
 def main():
     parser = argparse.ArgumentParser(
         description="Honest HTTP download client with throughput logging"
@@ -120,7 +101,6 @@ def main():
     args = parser.parse_args()
 
     download_with_telemetry(args.url, args.output, args.duration)
-
 
 if __name__ == "__main__":
     main()
